@@ -1,0 +1,48 @@
+{
+    "packages": [
+        {
+            "name": "mercadopago/dx-php",
+            "version": "v3.9.0",
+            "version_normalized": "3.9.0.0",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/mercadopago/sdk-php.git",
+                "reference": "7eeafc66b90ffda3d49dba6d81aeacc43e8621b4"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/mercadopago/sdk-php/zipball/7eeafc66b90ffda3d49dba6d81aeacc43e8621b4",
+                "reference": "7eeafc66b90ffda3d49dba6d81aeacc43e8621b4",
+                "shasum": ""
+            },
+            "require": {
+                "php": ">=8.2"
+            },
+            "require-dev": {
+                "friendsofphp/php-cs-fixer": "^3.22",
+                "phpunit/phpunit": "^10.2",
+                "squizlabs/php_codesniffer": "3.*"
+            },
+            "time": "2026-04-17T17:41:52+00:00",
+            "type": "library",
+            "installation-source": "dist",
+            "autoload": {
+                "psr-4": {
+                    "MercadoPago\\": "src/MercadoPago"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "description": "Mercado Pago PHP SDK",
+            "homepage": "https://github.com/mercadopago/sdk-php",
+            "support": {
+                "source": "https://github.com/mercadopago/sdk-php/tree/v3.9.0"
+            },
+            "install-path": "../mercadopago/dx-php"
+        }
+    ],
+    "dev": true,
+    "dev-package-names": []
+}

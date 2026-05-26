@@ -1,0 +1,82 @@
+Options -Indexes
+RewriteEngine On
+
+# Block dotfiles and sensitive files
+RewriteRule (^|/)\.(?!well-known/) - [F]
+RewriteRule ^vendor/ - [F,L]
+RewriteRule ^composer\.(json|lock)$ - [F,L]
+
+# Redirect / to index.php
+RewriteRule ^$ index.php [L]
+
+# Mercado Pago approved return
+RewriteRule ^aprovado/?$ conta.php [L,QSA]
+
+# Mercado Pago webhook
+RewriteRule ^mp/webhook/?$ checkout-pagamento.php?action=mp-webhook [L,QSA]
+
+# Allow direct file access
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+# Security: block access to includes
+RewriteRule ^includes/ - [F,L]
+
+# PHP handling
+AddType application/x-httpd-php .php
+
+# Compression: prefer Brotli, fall back to Gzip
+<IfModule mod_brotli.c>
+  AddOutputFilterByType BROTLI_COMPRESS text/html text/css application/javascript application/json text/plain text/xml image/svg+xml
+</IfModule>
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE text/html text/css application/javascript application/json text/plain text/xml image/svg+xml
+</IfModule>
+
+# Vary header so caches don't serve wrong encoding
+<IfModule mod_headers.c>
+  <FilesMatch "\.(css|js|html|json|xml|svg)$">
+    Header append Vary Accept-Encoding
+  </FilesMatch>
+</IfModule>
+
+# Ensure modern image formats have correct MIME types (older Apache may not know them).
+<IfModule mod_mime.c>
+  AddType image/webp .webp
+  AddType image/avif .avif
+</IfModule>
+
+# Cache static assets
+<IfModule mod_expires.c>
+  ExpiresActive On
+  # JS/CSS are fingerprinted with ?v= so safe to cache for 1 year
+  ExpiresByType text/css               "access plus 1 year"
+  ExpiresByType application/javascript "access plus 1 year"
+  # Images — 1 year; assets in /assets/images/ are stable (logo, banners).
+  # Product images are served from Supabase's CDN (Image Transformations) and
+  # carry their own Cache-Control + cache-buster, so these rules don't apply.
+  ExpiresByType image/png              "access plus 1 year"
+  ExpiresByType image/jpeg             "access plus 1 year"
+  ExpiresByType image/gif              "access plus 1 year"
+  ExpiresByType image/svg+xml          "access plus 1 year"
+  ExpiresByType image/webp             "access plus 1 year"
+  ExpiresByType image/avif             "access plus 1 year"
+  ExpiresByType image/x-icon           "access plus 1 year"
+  # Fonts
+  ExpiresByType font/woff2             "access plus 1 year"
+  ExpiresByType font/woff              "access plus 1 year"
+  ExpiresByType application/font-woff2 "access plus 1 year"
+</IfModule>
+
+# immutable tells browsers not to revalidate within max-age.
+# Safe for fingerprinted JS/CSS and for static images under /assets/ — those
+# files change rarely; on the rare update, bump the path or use a query string.
+<IfModule mod_headers.c>
+  <FilesMatch "\.(css|js)$">
+    Header merge Cache-Control "immutable"
+  </FilesMatch>
+  <FilesMatch "\.(png|jpe?g|gif|svg|webp|avif|ico|woff2?)$">
+    Header merge Cache-Control "immutable"
+  </FilesMatch>
+</IfModule>
