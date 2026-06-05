@@ -4,7 +4,6 @@ if (!isset($categories)) {
     require_once __DIR__ . '/config.php';
     $categories = fetch_categories(false);
 }
-$quick_cats = array_slice($categories, 0, 4, true);
 $current_path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $is_products = ($current_path === '/products.php' || $current_path === '/product.php');
 $active_cat = isset($_GET['categoria']) ? (string)$_GET['categoria'] : '';
@@ -42,16 +41,6 @@ $is_admin_path = (strpos($current_path, '/admin/') === 0);
           <?php endforeach; ?>
         </div>
       </div>
-
-      <!-- Quick category links (first 4 groups) -->
-      <div class="header-quick-cats">
-        <?php foreach ($quick_cats as $gid => $group): ?>
-          <?php $is_active_quick = $is_products && ($active_cat !== '') && ((string)$active_cat === (string)$gid || array_key_exists($active_cat, $group['children'] ?? [])); ?>
-          <a href="/products.php?categoria=<?= $gid ?>" class="header-quick-cat<?= $is_active_quick ? ' active' : '' ?>"<?= $is_active_quick ? ' aria-current="page"' : '' ?>>
-            <?= htmlspecialchars(cat_name($group['descr_grupo'])) ?>
-          </a>
-        <?php endforeach; ?>
-      </div>
     </nav>
 
     <!-- Actions -->
@@ -65,7 +54,7 @@ $is_admin_path = (strpos($current_path, '/admin/') === 0);
       <a href="/admin/index.php" id="header-admin-btn" class="header-action-btn<?= $is_admin_path ? ' active' : '' ?>"<?= $is_admin_path ? ' aria-current="page"' : '' ?> style="display:none">
         <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
         <span class="header-action-sublabel">Acesso Restrito</span>
-        <span class="header-action-label">Admin</span>
+        <span class="header-action-label"></span>
       </a>
 
       <!-- Account -->

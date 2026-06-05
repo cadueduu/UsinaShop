@@ -1,2 +1,4 @@
 .env
 .env.*
+api/debug-sb.php
+api/debug-*.php

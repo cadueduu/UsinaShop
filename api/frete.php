@@ -84,7 +84,15 @@ if (!$token) {
     exit;
 }
 
-$pesoG       = max(1, (int) round(floatval($body['peso']          ?? 0.3) * 1000));
+$pesoG_in = null;
+if (isset($body['pesoGramas']) && is_numeric($body['pesoGramas'])) {
+    $pesoG_in = (int) round(floatval($body['pesoGramas']));
+} elseif (isset($body['peso_g']) && is_numeric($body['peso_g'])) {
+    $pesoG_in = (int) round(floatval($body['peso_g']));
+}
+$pesoG = $pesoG_in !== null
+       ? max(300, $pesoG_in)
+       : max(300, (int) round(floatval($body['peso'] ?? 0.3) * 1000));
 $altura      = max(1, (int) ceil(floatval($body['altura']         ?? 10)));
 $largura     = max(1, (int) ceil(floatval($body['largura']        ?? 15)));
 $comprimento = max(1, (int) ceil(floatval($body['comprimento']    ?? 20)));
@@ -249,7 +257,7 @@ foreach ($servicos as $code) {
            : null;
 
     // noProduto is absent from batch preco responses — use a static fallback map.
-    static $serviceNames = ['03298' => 'SEDEX', '03220' => 'PAC'];
+    static $serviceNames = ['03298' => 'PAC', '03220' => 'SEDEX'];
     $nome = $pi['noProduto'] ?? ($serviceNames[$code] ?? $code);
 
     $result[] = [
@@ -257,6 +265,14 @@ foreach ($servicos as $code) {
         'nome'   => $nome,
         'preco'  => round($preco, 2),
         'prazo'  => $prazo,
+        'cep_origem' => $cepOrigem,
+        'cep_destino' => $cepDestino,
+        'peso_g' => $pesoG,
+        'peso_kg' => round($pesoG / 1000, 3),
+        'altura' => $altura,
+        'largura' => $largura,
+        'comprimento' => $comprimento,
+        'valor_declarado' => (int)$vlDeclarado,
     ];
 }
 

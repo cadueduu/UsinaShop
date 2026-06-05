@@ -254,7 +254,7 @@ async function saveCheckoutEditAddr(id) {
     cidade:      get('cidade'),
     uf:          get('uf').toUpperCase().slice(0, 2),
   }).eq('id', id);
-  if (error) { errEl.textContent = 'Erro ao salvar.'; errEl.style.display = 'block'; return; }
+  if (error) { errEl.textContent = 'Não foi possível salvar o endereço. Verifique sua conexão e tente novamente.'; errEl.style.display = 'block'; return; }
   // Reload addresses and keep selection
   const { data: { session } } = await sb.auth.getSession();
   const { data: addrs } = await sb.from('endereco').select('*').eq('cliente_id', session.user.id).order('is_padrao', { ascending: false });
@@ -355,8 +355,13 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Continue to payment
-  document.getElementById('continue-payment-btn')?.addEventListener('click', () => {
+  document.getElementById('continue-payment-btn')?.addEventListener('click', async () => {
     if (!selectedAddrId) return;
+    try {
+      if (window.flushAllPendingCartUpserts) {
+        await window.flushAllPendingCartUpserts();
+      }
+    } catch (_) {}
     window.location.href = '/checkout-pagamento.php?endereco=' + selectedAddrId;
   });
 });

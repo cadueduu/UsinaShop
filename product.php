@@ -29,25 +29,33 @@ $name   = prod_name($p);
 $price  = $p['preco'][0]['vlr_venda']           ?? 0;
 $stock  = $p['estoque'][0]['estoque_disponivel'] ?? 0;
 
-// Restrict the gallery to verified low-resolution variants. Any image whose
-// path/URL is not a confirmed low asset is dropped — the storefront must never
-// render or rotate to a high-res variant.
-$images = array_values(array_filter(
-    $p['produto_imagem'] ?? [],
-    function ($img) {
-        if (!empty($img['path'])) {
-            $p = (string)$img['path'];
-            if (preg_match('/(^|[\/_.\-])high([\/_.\-]|$)/i', $p)) return false;
-            return (bool) preg_match('/(^|[\/_.\-])low([\/_.\-]|$)/i', $p);
-        }
-        return !empty($img['url']) && is_low_resolution_image_url((string)$img['url']);
+$render_url = function (array $img, int $width, int $quality, string $format): string {
+    if (!empty($img['path'])) {
+        $u = supabase_image_url((string)$img['path'], $width, $quality, $format);
+        $v = (string)($img['version'] ?? '');
+        if ($u !== '' && $v !== '') $u .= '&v=' . rawurlencode($v);
+        return $u;
     }
-));
-if (!empty($images)) usort($images, fn($a,$b) => ($a['ordem']??999) - ($b['ordem']??999));
-// Main hero image: larger width + slightly higher quality than the catalog cards.
-$main_img = !empty($images)
-          ? product_image_render_url($images[0], 800, 75, 'webp')
-          : '/assets/images/produtos/logo.png';
+    $url = trim((string)($img['url'] ?? ''));
+    if ($url === '') return '';
+    if ($url[0] === '/') return $url;
+    $path = parse_url($url, PHP_URL_PATH) ?? '';
+    if ($path !== '' && str_contains($path, '/storage/v1/render/image/public/')) return $url;
+    $sb_path = supabase_path_from_public_url($url);
+    if ($sb_path !== '') {
+        $u = supabase_image_url($sb_path, $width, $quality, $format);
+        if ($u !== '') return $u;
+    }
+    return $url;
+};
+
+$images = array_values(array_filter($p['produto_imagem'] ?? [], function ($img) use ($render_url) {
+    if (!is_array($img)) return false;
+    $u = $render_url($img, 800, 75, 'webp');
+    return $u !== '' && $u !== '/assets/images/produtos/logo.png';
+}));
+if (!empty($images)) usort($images, fn($a, $b) => ($a['ordem'] ?? 999) - ($b['ordem'] ?? 999));
+$main_img = !empty($images) ? $render_url($images[0], 800, 75, 'webp') : '/assets/images/produtos/logo.png';
 $main_is_low = is_low_resolution_image_url($main_img);
 $specs    = $p['especificacao'] ?? [];
 $desc     = $p['descrprodoed'] ?? $p['desccurta'] ?? '';
@@ -117,7 +125,7 @@ include __DIR__ . '/includes/mobile-bar.php';
                src="<?= htmlspecialchars($main_img) ?>"
                alt="<?= htmlspecialchars($name) ?>"
                width="800" height="800"
-               <?php if ($main_is_low): ?>fetchpriority="high"<?php endif; ?>
+               <?php if ($main_is_low): ?>fetchpriority="low"<?php endif; ?>
                decoding="async"
                onerror="this.src='/assets/images/produtos/logo.png'"
                style="transition:opacity .2s;">
@@ -144,10 +152,10 @@ include __DIR__ . '/includes/mobile-bar.php';
           <?php
             // Thumbs are 120×120 in the layout; ask Supabase for ~200px so retina
             // displays still get a crisp render without re-fetching the hero.
-            $thumb_url = product_image_render_url($img, 200, 60, 'webp');
+            $thumb_url = $render_url($img, 200, 60, 'webp');
             // Gallery swap target — same render as the hero (800×75) so rotation
             // does not stretch the small thumb when it takes over the main slot.
-            $gallery_url = product_image_render_url($img, 800, 75, 'webp');
+            $gallery_url = $render_url($img, 800, 75, 'webp');
             /* Eager-load the first 3 thumbs: they sit directly under the main image
                (above the fold on desktop) and feed the auto-rotating gallery, so
                deferring them just produces visible flicker on rotation. */
@@ -158,7 +166,7 @@ include __DIR__ . '/includes/mobile-bar.php';
                compete with the main image. Any non-low URL (defense in depth —
                $images is already filtered to low-only) gets no fetchpriority. */
             $thumb_is_low  = is_low_resolution_image_url($thumb_url);
-            $thumb_fetchpri = $thumb_is_low ? ($i === 0 ? 'high' : 'low') : '';
+            $thumb_fetchpri = $thumb_is_low ? 'low' : '';
           ?>
           <div class="gallery-thumb<?= $i===0?' active':'' ?>"
                data-gallery-src="<?= htmlspecialchars($gallery_url) ?>">
@@ -183,7 +191,6 @@ include __DIR__ . '/includes/mobile-bar.php';
         <!-- Price -->
         <div class="detail-price">
           <span><?= fmt_brl($price) ?></span>
-          <span class="detail-price-note">à vista ou em 12x no cartão</span>
         </div>
 
         <!-- Stock -->
@@ -218,36 +225,14 @@ include __DIR__ . '/includes/mobile-bar.php';
           data-price="<?= htmlspecialchars((string)$price) ?>"
           data-image="<?= htmlspecialchars($main_img) ?>"
           data-peso="<?= $peso ?>"
+          data-altura="<?= $altura ?>"
+          data-largura="<?= $largura ?>"
+          data-comprimento="<?= $comprimento ?>"
           data-qty-input="detail-qty"
         >
           <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z"/></svg>
           <?= $stock > 0 ? 'Comprar Agora' : 'Fora de Estoque' ?>
         </button>
-
-        <hr style="border:none;border-top:1px solid #e5e7eb;margin:1.25rem 0;">
-
-        <!-- Freight calculator -->
-        <div class="freight-section">
-          <div class="freight-title">
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="#ca8a04"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17a2 2 0 11-4 0 2 2 0 014 0zM19 17a2 2 0 11-4 0 2 2 0 014 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16V6a1 1 0 00-1-1H4a1 1 0 00-1 1v10l2 .001m9 0H7M13 16V11m0 5h5.5a1.5 1.5 0 001.5-1.5V14m-7-3h7m0 0V8a2 2 0 00-2-2h-5"/></svg>
-            Calcular Frete e Prazo
-          </div>
-          <p class="freight-note">O valor do frete pode variar de acordo com a quantidade de itens.</p>
-          <form id="freight-form"
-            data-codprod="<?= $pid ?>"
-            data-price="<?= htmlspecialchars((string)$price) ?>"
-            data-peso="<?= $peso ?>"
-            data-altura="<?= $altura ?>"
-            data-largura="<?= $largura ?>"
-            data-comprimento="<?= $comprimento ?>">
-            <div class="freight-input-row">
-              <input type="text" id="freight-cep" class="input-field" placeholder="Digite seu CEP"
-                     maxlength="9" inputmode="numeric">
-              <button type="submit" id="freight-calc-btn" class="freight-calc-btn" disabled>Calcular</button>
-            </div>
-          </form>
-          <div id="freight-result"></div>
-        </div>
 
         <!-- Specs -->
         <?php if (!empty($specs)): ?>

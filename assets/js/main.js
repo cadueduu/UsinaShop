@@ -34,25 +34,58 @@ function getSB() {
   return _sbClient;
 }
 
-// ─── CART STORE (somente banco — sem localStorage) ────────
+// ─── CART STORE (memória + localStorage fallback) ─────────
+// localStorage mirrors in-memory state on every change. Acts as a safety net
+// for the 600ms DB debounce window: if the tab closes mid-flight, the next
+// page load restores from localStorage before the DB sync runs.
+const CART_LS_KEY = 'spark_cart_items';
+
+function loadCartFromStorage() {
+  try {
+    const raw = localStorage.getItem(CART_LS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveCartToStorage(items) {
+  try {
+    localStorage.setItem(CART_LS_KEY, JSON.stringify(items));
+  } catch (e) { /* quota or disabled — ignore */ }
+}
+
+function clearCartStorage() {
+  try { localStorage.removeItem(CART_LS_KEY); } catch (e) { /* ignore */ }
+}
+
 const Cart = (() => {
-  let items = []; // memória de sessão apenas
+  let items = loadCartFromStorage();
 
   function count()    { return items.reduce((s, i) => s + (parseInt(i.qty, 10) || 0), 0); }
   function total()    { return items.reduce((s, i) => s + (Number(i.price) * (parseInt(i.qty, 10) || 0)), 0); }
   function getAll()   { return [...items]; }
-  function setItems(newItems) { items = newItems; updateCartUI(); renderCartItems(); }
+  function setItems(newItems) { items = newItems; saveCartToStorage(items); updateCartUI(); renderCartItems(); }
 
   function add(item) {
-    if (!window.APP_LOCAL_MODE && !UserStore.isLoggedIn()) {
-      window.location.href = '/login.php?redirect=' + encodeURIComponent(window.location.pathname + window.location.search);
-      return;
-    }
     const existing = items.find(i => i.id === item.id);
     const newQty = (parseInt(existing?.qty, 10) || 0) + (parseInt(item.qty, 10) || 1);
     const peso = parseFloat(item.peso || existing?.peso || 0.3);
-    if (existing) { existing.qty = newQty; existing.peso = peso; }
-    else { items.push({ id: item.id, name: item.name, price: item.price, image: item.image, qty: item.qty || 1, peso }); }
+    const altura      = parseInt(item.altura      || existing?.altura      || 10, 10);
+    const largura     = parseInt(item.largura     || existing?.largura     || 15, 10);
+    const comprimento = parseInt(item.comprimento || existing?.comprimento || 20, 10);
+    if (existing) {
+      existing.qty = newQty; existing.peso = peso;
+      existing.altura = altura; existing.largura = largura; existing.comprimento = comprimento;
+    } else {
+      items.push({
+        id: item.id, name: item.name, price: item.price, image: item.image,
+        qty: parseInt(item.qty, 10) || 1, peso, altura, largura, comprimento,
+      });
+    }
+    saveCartToStorage(items);
     updateCartUI();
     CartSidebar.open();
     if (!window.APP_LOCAL_MODE) upsertCartItemDB(item.id, newQty, peso);
@@ -60,6 +93,7 @@ const Cart = (() => {
 
   function remove(id) {
     items = items.filter(i => i.id !== id);
+    saveCartToStorage(items);
     updateCartUI();
     renderCartItems();
     if (!window.APP_LOCAL_MODE) upsertCartItemDB(id, 0, 0);
@@ -69,6 +103,7 @@ const Cart = (() => {
     const newQty = Math.max(1, qty);
     const item = items.find(i => i.id === id);
     if (item) { item.qty = newQty; }
+    saveCartToStorage(items);
     updateCartUI();
     renderCartItems();
     if (!window.APP_LOCAL_MODE) upsertCartItemDB(id, newQty, item?.peso || 0.3);
@@ -76,6 +111,7 @@ const Cart = (() => {
 
   function clear() {
     items = [];
+    clearCartStorage();
     updateCartUI();
     renderCartItems();
     // Limpeza no DB feita por finalizarCompra após criar o pedido
@@ -123,6 +159,7 @@ async function syncCartFromDB(userId) {
         altura:      parseInt(prod.altura      || 10),
         largura:     parseInt(prod.largura     || 15),
         comprimento: parseInt(prod.comprimento || 20),
+        embPeso:     parseFloat(emb.peso || 0) || 0,
         embAltura:   parseInt(emb.altura       || prod.altura      || 10),
         embLargura:  parseInt(emb.largura      || prod.largura     || 15),
         embComprimento: parseInt(emb.comprimento || prod.comprimento || 20),
@@ -130,31 +167,79 @@ async function syncCartFromDB(userId) {
     });
 
     Cart.setItems(cartItems);
+    // DB is now canonical for this authenticated session.
+    // setItems already saved the freshly-loaded items to localStorage above.
   } catch(e) { console.error('Erro ao carregar carrinho:', e); }
 }
 
+// Flush any pending debounced cart upserts before the tab unloads. Uses both
+// 'pagehide' (modern, mobile-friendly) and 'beforeunload' (broad compat).
+window.addEventListener('pagehide', flushAllPendingCartUpserts);
+window.addEventListener('beforeunload', flushAllPendingCartUpserts);
+
 const _cartUpsertTimers = {};
+const _cartUpsertPending = {};
 function upsertCartItemDB(id, qty, pesoUnitario = 0.3) {
   clearTimeout(_cartUpsertTimers[id]);
-  _cartUpsertTimers[id] = setTimeout(() => _flushCartUpsert(id, qty), 600);
+  _cartUpsertPending[id] = qty;
+  _cartUpsertTimers[id] = setTimeout(() => {
+    delete _cartUpsertPending[id];
+    _flushCartUpsert(id, qty);
+  }, 600);
 }
+
+// Flush every pending debounced upsert synchronously — called on beforeunload
+// so changes made within the 600ms debounce window don't get lost when the
+// user closes the tab.
+async function flushAllPendingCartUpserts() {
+  const tasks = [];
+  for (const id of Object.keys(_cartUpsertPending)) {
+    clearTimeout(_cartUpsertTimers[id]);
+    const qty = _cartUpsertPending[id];
+    delete _cartUpsertPending[id];
+    tasks.push(_flushCartUpsert(id, qty));
+  }
+  if (tasks.length) await Promise.allSettled(tasks);
+}
+
+// Per-item AbortControllers: when a new flush starts, the previous in-flight
+// request for the same codprod is cancelled so the latest desired qty always
+// wins on the server, regardless of network reordering.
+const _cartUpsertAborters = {};
 
 async function _flushCartUpsert(id, qty) {
   const sb = getSB();
   if (!sb) return;
+
+  if (_cartUpsertAborters[id]) {
+    try { _cartUpsertAborters[id].abort(); } catch (_) { /* ignore */ }
+  }
+  const controller = new AbortController();
+  _cartUpsertAborters[id] = controller;
+
   try {
     const { data: { session } } = await sb.auth.getSession();
     if (!session) return;
     if (qty <= 0) {
-      await sb.from('carrinho').delete().eq('cliente_id', session.user.id).eq('codprod', id);
+      await sb.from('carrinho')
+        .delete()
+        .eq('cliente_id', session.user.id)
+        .eq('codprod', id)
+        .abortSignal(controller.signal);
     } else {
       // peso_total é calculado automaticamente pelo trigger no banco (produto.peso × quantidade)
-      await sb.from('carrinho').upsert(
-        { cliente_id: session.user.id, codprod: id, quantidade: qty },
-        { onConflict: 'cliente_id,codprod' }
-      );
+      await sb.from('carrinho')
+        .upsert(
+          { cliente_id: session.user.id, codprod: id, quantidade: qty },
+          { onConflict: 'cliente_id,codprod' }
+        )
+        .abortSignal(controller.signal);
     }
-  } catch(e) { console.error('Erro ao sincronizar carrinho:', e); }
+  } catch(e) {
+    if (e?.name !== 'AbortError') console.error('Erro ao sincronizar carrinho:', e);
+  } finally {
+    if (_cartUpsertAborters[id] === controller) delete _cartUpsertAborters[id];
+  }
 }
 
 // ─── CART UI ──────────────────────────────────────────────
@@ -196,7 +281,7 @@ function renderCartItems() {
   body.innerHTML = items.map(item => `
     <div class="cart-item" data-id="${item.id}">
       <div class="cart-item__img">
-        <img src="${item.image}" alt="${escHtml(item.name)}" onerror="this.src='/assets/images/produtos/logo.png'">
+        <img src="${item.image}" alt="${escHtml(item.name)}" loading="lazy" decoding="async" onerror="this.src='/assets/images/produtos/logo.png'">
       </div>
       <div class="cart-item__info">
         <div class="cart-item__name">${escHtml(item.name)}</div>
@@ -295,7 +380,7 @@ async function loadSearchCats() {
     list.innerHTML = `<a href="/products.php" class="search-cat-item">Todos os Produtos</a>` +
       level1.map(c => `<a href="/products.php?categoria=${c.codgrupoprod}" class="search-cat-item">${fmtCatName(c.descr_grupo)}<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg></a>`).join('');
     list.dataset.loaded = '1';
-  } catch(e) { list.innerHTML = '<p class="text-sm text-gray-500">Erro ao carregar categorias.</p>'; }
+  } catch(e) { list.innerHTML = '<p class="text-sm text-gray-500">Não foi possível carregar as categorias. Tente recarregar a página.</p>'; }
 }
 
 function fmtCatName(name) {
@@ -333,11 +418,22 @@ const UserStore = {
       await this.loadUser(session.user.id);
       await syncCartFromDB(session.user.id);
     }
+    // Mirror Supabase access token to a cookie so server-side admin gating works.
+    const syncTokenCookie = (tok) => {
+      const secure = location.protocol === 'https:' ? '; Secure' : '';
+      document.cookie = 'sb_token=' + (tok || '') + '; Path=/; SameSite=Lax; Max-Age=' + (tok ? 3600 : 0) + secure;
+    };
+    if (session?.access_token) syncTokenCookie(session.access_token);
+
     sb.auth.onAuthStateChange(async (event, session) => {
       if (event === 'SIGNED_IN' && session?.user) {
+        syncTokenCookie(session.access_token);
         await this.loadUser(session.user.id);
         await syncCartFromDB(session.user.id);
+      } else if (event === 'TOKEN_REFRESHED' && session?.access_token) {
+        syncTokenCookie(session.access_token);
       } else if (event === 'SIGNED_OUT') {
+        syncTokenCookie('');
         this.user = null;
         this.updateUI();
       }
@@ -363,7 +459,7 @@ const UserStore = {
       if (u) {
         const firstName = (u.nome || '').split(' ')[0];
         btnAcct.querySelector('.header-action-sublabel').textContent = 'Olá, ' + firstName;
-        btnAcct.querySelector('.header-action-label').textContent = 'Minha Conta';
+        btnAcct.querySelector('.header-action-label').textContent = '';
         btnAcct.href = '/conta.php';
       } else {
         btnAcct.querySelector('.header-action-sublabel').textContent = '';
@@ -569,12 +665,15 @@ async function lookupCep(cepInput) {
   let hint = container.querySelector('.cep-hint');
   if (hint) hint.remove();
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
+
   try {
-    const res  = await fetch(`https://viacep.com.br/ws/${clean}/json/`);
+    const res  = await fetch(`https://viacep.com.br/ws/${clean}/json/`, { signal: controller.signal });
     const data = await res.json();
 
     if (data.erro) {
-      showCepHint(cepInput, 'CEP não encontrado.', true);
+      showCepHint(cepInput, 'CEP não encontrado. Confira o número ou preencha o endereço manualmente.', true);
     } else {
       if (f.logradouro) { f.logradouro.value = data.logradouro || ''; }
       if (f.bairro)     { f.bairro.value     = data.bairro     || ''; }
@@ -585,8 +684,13 @@ async function lookupCep(cepInput) {
       if (f.numero && !f.numero.value) setTimeout(() => f.numero.focus(), 50);
     }
   } catch(e) {
-    showCepHint(cepInput, 'Erro ao consultar CEP.', true);
+    if (e.name === 'AbortError') {
+      showCepHint(cepInput, 'Não foi possível buscar o CEP. Preencha o endereço manualmente.', true);
+    } else {
+      showCepHint(cepInput, 'Erro ao consultar CEP. Preencha o endereço manualmente.', true);
+    }
   } finally {
+    clearTimeout(timeoutId);
     cepInput.style.opacity = '';
     cepInput.readOnly = false;
   }
@@ -598,7 +702,14 @@ function showCepHint(input, msg, isError) {
   hint.style.cssText = `display:block;margin-top:.25rem;font-size:.75rem;color:${isError ? '#ef4444' : '#16a34a'};`;
   hint.textContent = msg;
   input.parentNode.appendChild(hint);
-  setTimeout(() => hint.remove(), 4000);
+  // Dismiss on focus of any sibling input (user moved on), or after 8s.
+  const dismissTimer = setTimeout(() => hint.remove(), 8000);
+  const dismissOnNext = () => { clearTimeout(dismissTimer); hint.remove(); };
+  const form = input.closest('form, [data-address-form], .addr-edit-form, [id^="co-edit-"], [id^="edit-form-"]');
+  form?.querySelectorAll('input, select, textarea').forEach(el => {
+    if (el === input) return;
+    el.addEventListener('focus', dismissOnNext, { once: true });
+  });
 }
 
 function initCepInputs() {
@@ -757,20 +868,44 @@ function initLoginPage() {
         }
       }
     });
-    if (error) { errEl.textContent = error.message; errEl.style.display = 'block'; btn.textContent = 'Cadastrar'; btn.disabled = false; return; }
+    if (error) {
+      const raw = String(error.message || '').toLowerCase();
+      let friendly = 'Não foi possível concluir o cadastro. Verifique os dados e tente novamente.';
+      if (raw.includes('already') || raw.includes('exists') || raw.includes('registered')) {
+        friendly = 'Este e-mail já está cadastrado. Tente entrar ou use outro endereço.';
+      } else if (raw.includes('password') || raw.includes('senha')) {
+        friendly = 'Senha não atende aos requisitos. Use ao menos 6 caracteres.';
+      } else if (raw.includes('email') || raw.includes('invalid')) {
+        friendly = 'E-mail inválido. Confira o endereço informado.';
+      }
+      errEl.textContent = friendly;
+      errEl.style.display = 'block';
+      btn.textContent = 'Cadastrar';
+      btn.disabled = false;
+      return;
+    }
 
     signupForm.style.display = 'none';
     if (successScr) { successScr.classList.add('active'); successScr.style.display = 'flex'; }
   });
 }
 
-// ─── FREIGHT CALCULATOR ───────────────────────────────────
+// ─── FREIGHT CALCULATOR (cart-wide) ───────────────────────
+const CART_CEP_LS_KEY = 'spark_cart_cep';
+
 function initFreightCalc() {
-  const form    = document.getElementById('freight-form');
-  if (!form) return;
-  const cepInput = form.querySelector('#freight-cep');
-  const calcBtn  = form.querySelector('#freight-calc-btn');
-  const result   = document.getElementById('freight-result');
+  const form = document.getElementById('cart-freight-form');
+  if (!form || form.dataset.initialized === '1') return;
+  form.dataset.initialized = '1';
+
+  const cepInput = form.querySelector('#cart-freight-cep');
+  const calcBtn  = form.querySelector('#cart-freight-calc-btn');
+  const result   = document.getElementById('cart-freight-result');
+
+  try {
+    const saved = localStorage.getItem(CART_CEP_LS_KEY);
+    if (saved && cepInput) { cepInput.value = saved; if (calcBtn) calcBtn.disabled = saved.replace(/\D/g,'').length < 8; }
+  } catch (_) { /* ignore */ }
 
   cepInput?.addEventListener('input', function() {
     const val = this.value.replace(/\D/g,'');
@@ -780,81 +915,237 @@ function initFreightCalc() {
   form.addEventListener('submit', async function(e) {
     e.preventDefault();
     const cep = cepInput.value.replace(/\D/g,'');
-    const qty = parseInt(document.getElementById('detail-qty')?.value || '1');
     if (cep.length < 8) return;
+
+    const items = Cart.getAll();
+    if (items.length === 0) {
+      result.innerHTML = '<p class="alert alert-error">Adicione itens ao carrinho para calcular o frete.</p>';
+      return;
+    }
+
+    try { localStorage.setItem(CART_CEP_LS_KEY, cep); } catch (_) { /* ignore */ }
+
     if (result) result.innerHTML = '<div class="spinner spinner-sm" style="margin:1rem auto;"></div>';
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
     try {
-      const codprod = parseInt(form.dataset.codprod || '0', 10) || 0;
-      if (codprod <= 0) {
-        if (result) result.innerHTML = '<p class="alert alert-error">Produto inválido para cálculo de frete.</p>';
+      const cepOrigem = String(window.APP_CEP_ORIGEM || '').replace(/\D/g, '');
+      if (cepOrigem.length !== 8) {
+        result.innerHTML = '<p class="alert alert-error">CEP de origem inválido. Recarregue a página e tente novamente.</p>';
         return;
       }
-      const cepOrigem = String(window.APP_CEP_ORIGEM || '').replace(/\D/g, '');
-      if (cepOrigem.length !== 8) { result.innerHTML = '<p class="alert alert-error">CEP de origem inválido.</p>'; return; }
 
-      const unitPrice = parseFloat(form.dataset.price || '0') || 0;
-      const payload = {
-        cepOrigem,
-        cepDestino: cep,
-        peso:        parseFloat(form.dataset.peso        || '0.3') * qty,
-        altura:      parseFloat(form.dataset.altura      || '10'),
-        largura:     parseFloat(form.dataset.largura     || '15'),
-        comprimento: parseFloat(form.dataset.comprimento || '20'),
-      };
-      if (unitPrice > 0) payload.valorDeclarado = unitPrice * qty;
+      const cartItemsFull = (typeof Cart !== 'undefined') ? Cart.getAll() : items;
+      const ids = Array.from(new Set(cartItemsFull.map(it => parseInt(it.id, 10)).filter(v => Number.isFinite(v) && v > 0)));
+      const sb = getSB();
+      const packMap = {};
+      if (sb && ids.length > 0) {
+        const { data } = await sb
+          .from('produto')
+          .select('codprod,codprodemb,embalagem:codprodemb(peso,altura,largura,comprimento)')
+          .in('codprod', ids);
+        if (Array.isArray(data)) {
+          data.forEach(r => {
+            const emb = r?.embalagem || null;
+            if (!r?.codprod || !emb) return;
+            packMap[String(r.codprod)] = emb;
+          });
+        }
+      }
 
-      const res = await fetch('/api/frete.php', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+      const missing = [];
+      let pesoGramas = 0;
+      let altura = 0, largura = 0, comprimento = 0;
+      let subtotal = 0;
+      cartItemsFull.forEach(it => {
+        const qty = parseInt(it.qty, 10) || 0;
+        const emb = packMap[String(it.id)] || null;
+        if (!emb) { missing.push(it.id); return; }
+        const pPeso = parseFloat(emb.peso || 0);
+        const pA = parseFloat(emb.altura || 0);
+        const pL = parseFloat(emb.largura || 0);
+        const pC = parseFloat(emb.comprimento || 0);
+        if (!(pPeso > 0 && pA > 0 && pL > 0 && pC > 0)) { missing.push(it.id); return; }
+        pesoGramas += Math.max(1, Math.round(pPeso * qty * 1000));
+        altura = Math.max(altura, Math.ceil(pA));
+        largura = Math.max(largura, Math.ceil(pL));
+        comprimento = Math.max(comprimento, Math.ceil(pC));
+        subtotal += (Number(it.price) || 0) * qty;
       });
-      const opts = await res.json();
-      if (opts?.error) throw new Error(String(opts.error));
-      if (!Array.isArray(opts) || opts.length === 0) throw new Error('sem_servicos');
+
+      if (missing.length) {
+        result.innerHTML = '<p class="alert alert-error">Não foi possível calcular o frete: há produto(s) sem embalagem configurada.</p>';
+        return;
+      }
+
+      pesoGramas = Math.max(300, pesoGramas);
+      altura = Math.max(1, altura || 10);
+      largura = Math.max(1, largura || 15);
+      comprimento = Math.max(1, comprimento || 20);
+
+      function parsePrecoItem(item) {
+        if (!item || typeof item !== 'object') return null;
+        const raw = item.pcTotal ?? item.pcFinal ?? item.pcServico ?? item.pcBase ?? null;
+        if (raw == null) return null;
+        let s = String(raw).replace('R$', '').trim();
+        if (s.includes(',') && s.includes('.')) {
+          s = s.replace(/\./g, '').replace(',', '.');
+        } else if (s.includes(',')) {
+          s = s.replace(',', '.');
+        }
+        const n = parseFloat(s);
+        return isFinite(n) ? n : null;
+      }
+
+      async function fetchCorreiosPreco(code) {
+        const res = await fetch('/api/correios-preco.php', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ coProduto: code, cepOrigem, cepDestino: cep, pesoGramas, altura, largura, comprimento, valorDeclarado: subtotal }),
+          signal: controller.signal,
+        });
+        const data = await res.json();
+        if (data?.error) throw new Error(String(data.error));
+        const valor = parsePrecoItem(data?.item);
+        if (!valor || valor <= 0) throw new Error('preco_invalido');
+        return { valor, nome: String(data?.item?.noProduto || data?.item?.coProduto || code) };
+      }
+
+      async function fetchCorreiosPrazo(code) {
+        const res = await fetch('/api/correios-data-entrega.php', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ coProduto: code, cepOrigem, cepDestino: cep }),
+          signal: controller.signal,
+        });
+        const data = await res.json();
+        if (data?.error) throw new Error(String(data.error));
+        const prazo = data?.prazoEntrega ?? data?.prazoItem?.prazoEntrega ?? null;
+        const n = prazo != null ? parseInt(prazo, 10) : null;
+        return (n && isFinite(n) && n > 0) ? n : null;
+      }
+
+      const servicos = [
+        { code: '03298', label: 'PAC' },
+        { code: '03220', label: 'SEDEX' },
+      ];
+
+      const settled = await Promise.allSettled(servicos.map(async (s) => {
+        const preco = await fetchCorreiosPreco(s.code);
+        let prazo = null;
+    try { prazo = await fetchCorreiosPrazo(s.code); } catch (_) { prazo = null; }
+        return { code: s.code, label: s.label, preco: preco.valor, prazo };
+      }));
+
+      const opts = [];
+      settled.forEach((s, idx) => {
+        const svc = servicos[idx];
+        if (s.status === 'fulfilled' && s.value?.preco && s.value.preco > 0) {
+          opts.push({ nome: svc.label, preco: s.value.preco, prazo: s.value.prazo });
+        }
+      });
+
+      if (opts.length === 0) throw new Error('sem_servicos');
 
       result.innerHTML = opts.map(opt => `
         <div class="freight-option">
           <div>
             <div class="freight-option-name">${opt.nome}</div>
-            ${opt.prazo ? `<div class="freight-option-days">Prazo: ${opt.prazo} dias úteis</div>` : ''}
+            <div class="freight-option-days">${opt.prazo
+              ? `Prazo: ${opt.prazo} dias úteis`
+              : 'Prazo de entrega indisponível no momento'}</div>
           </div>
           <div class="freight-option-val">R$ ${opt.preco.toFixed(2).replace('.', ',')}</div>
         </div>`).join('');
     } catch(err) {
-      if (result) result.innerHTML = '<p class="alert alert-error">Erro ao calcular frete.</p>';
+      if (!result) return;
+      if (err?.name === 'AbortError') {
+        result.innerHTML = '<p class="alert alert-error">A consulta de frete demorou demais. Verifique sua conexão e tente novamente.</p>';
+      } else {
+        result.innerHTML = '<p class="alert alert-error">Não foi possível calcular o frete agora. Tente novamente em instantes.</p>';
+      }
+    } finally {
+      clearTimeout(timeoutId);
     }
   });
 }
 
 // ─── ADD TO CART (product card / detail) ─────────────────
-function addToCart(id, name, price, image, qty) {
+function addToCart(id, name, price, image, qty, peso, altura, largura, comprimento) {
   Cart.add({
     id: parseInt(id, 10),
     name,
     price: parseFloat(price),
     image: image || '/assets/images/produtos/logo.png',
-    qty: parseInt(qty, 10) || 1
+    qty: parseInt(qty, 10) || 1,
+    peso: peso != null ? parseFloat(peso) : undefined,
+    altura: altura != null ? parseInt(altura, 10) : undefined,
+    largura: largura != null ? parseInt(largura, 10) : undefined,
+    comprimento: comprimento != null ? parseInt(comprimento, 10) : undefined,
   });
 }
 
 window.addToCart = addToCart;
 window.Cart = Cart;
 window.CartSidebar = CartSidebar;
+window.flushAllPendingCartUpserts = flushAllPendingCartUpserts;
 
-document.addEventListener('click', (e) => {
+// Opportunistic stock check: queries Supabase directly at click time so a
+// product that went out of stock between page load and click can't slip in.
+// Fails open — if Supabase is unreachable or LOCAL_DATA_MODE is set, the add
+// proceeds (the legacy behavior). Returns the requested qty if allowed, or a
+// reduced qty / 0 when there isn't enough stock.
+async function checkStockAvailable(codprod, requestedQty) {
+  if (window.APP_LOCAL_MODE) return requestedQty;
+  const sb = getSB();
+  if (!sb) return requestedQty;
+  try {
+    const { data, error } = await sb
+      .from('estoque')
+      .select('estoque_disponivel')
+      .eq('codprod', codprod)
+      .limit(1)
+      .maybeSingle();
+    if (error || !data) return requestedQty;
+    const available = parseInt(data.estoque_disponivel, 10) || 0;
+    return Math.min(requestedQty, available);
+  } catch (e) {
+    return requestedQty;
+  }
+}
+
+document.addEventListener('click', async (e) => {
   const btn = e.target?.closest?.('[data-add-to-cart="1"]');
   if (!btn) return;
   if (btn.hasAttribute('disabled')) return;
   e.preventDefault();
 
-  const id = btn.getAttribute('data-id');
+  const id = parseInt(btn.getAttribute('data-id'), 10);
   const name = btn.getAttribute('data-name') || '';
   const price = btn.getAttribute('data-price') || '0';
   const image = btn.getAttribute('data-image') || '/assets/images/produtos/logo.png';
   const peso  = btn.getAttribute('data-peso')  || '0.3';
+  const altura      = btn.getAttribute('data-altura')      || '10';
+  const largura     = btn.getAttribute('data-largura')     || '15';
+  const comprimento = btn.getAttribute('data-comprimento') || '20';
   const qtyInputId = btn.getAttribute('data-qty-input');
-  const qty = qtyInputId ? (document.getElementById(qtyInputId)?.value || '1') : (btn.getAttribute('data-qty') || '1');
-  Cart.add({ id: parseInt(id, 10), name, price: parseFloat(price), image, qty: parseInt(qty, 10) || 1, peso: parseFloat(peso) });
+  const requestedQty = parseInt(qtyInputId ? (document.getElementById(qtyInputId)?.value || '1') : (btn.getAttribute('data-qty') || '1'), 10) || 1;
+
+  const allowedQty = await checkStockAvailable(id, requestedQty);
+  if (allowedQty <= 0) {
+    alert('Este produto está sem estoque no momento.');
+    return;
+  }
+  if (allowedQty < requestedQty) {
+    alert(`Apenas ${allowedQty} unidade(s) disponível(is) em estoque. Quantidade ajustada.`);
+  }
+  Cart.add({
+    id, name, price: parseFloat(price), image, qty: allowedQty,
+    peso: parseFloat(peso),
+    altura: parseInt(altura, 10), largura: parseInt(largura, 10), comprimento: parseInt(comprimento, 10),
+  });
 });
 
 // ─── LOAD MORE (product listing) ─────────────────────────
@@ -873,10 +1164,15 @@ function safeImgUrl(url) {
   try {
     const u = new URL(url, window.location.origin);
     if (u.origin === window.location.origin) return url;
-    if (HIGH_RE.test(u.pathname)) return FALLBACK;
     if (/[?&](resolution|quality|res)[=_]high/i.test(u.search)) return FALLBACK;
-    if (!LOW_RE.test(u.pathname)) return FALLBACK;
-    return url;
+    if (LOW_RE.test(u.pathname)) return url;
+    if (u.pathname.includes('/storage/v1/render/image/public/')) {
+      const w = parseInt(u.searchParams.get('width') || '', 10);
+      const q = parseInt(u.searchParams.get('quality') || '', 10);
+      if (Number.isFinite(w) && Number.isFinite(q) && w > 0 && w <= 900 && q > 0 && q <= 80) return url;
+    }
+    if (HIGH_RE.test(u.pathname)) return FALLBACK;
+    return FALLBACK;
   } catch (_) {
     return FALLBACK;
   }
@@ -888,8 +1184,8 @@ function renderProductCard(p) {
   return `<div class="product-card">
   <a href="${escHtml(p.url)}" class="product-card__img">
     <img src="${escHtml(img)}" alt="${escHtml(p.name)}" width="400" height="400"
-         loading="lazy" decoding="async"
-         onerror="this.src='/assets/images/produtos/logo.png'">
+         fetchpriority="low" loading="lazy" decoding="async"
+         onerror="this.closest('.product-card')?.remove()">
   </a>
   <div class="product-card__body">
     <a href="${escHtml(p.url)}" class="product-card__name">${escHtml(p.name)}</a>
@@ -899,6 +1195,10 @@ function renderProductCard(p) {
       data-name="${escHtml(p.name)}"
       data-price="${escHtml(p.price)}"
       data-image="${escHtml(img)}"
+      data-peso="${escHtml(p.peso ?? 0.3)}"
+      data-altura="${escHtml(p.altura ?? 10)}"
+      data-largura="${escHtml(p.largura ?? 15)}"
+      data-comprimento="${escHtml(p.comprimento ?? 20)}"
       data-qty="1">
       ${cartSvg} Adicionar
     </button>
@@ -912,62 +1212,165 @@ function initLoadMore() {
   const grid = document.getElementById('products-grid');
   if (!btn || !grid) return;
 
-  let loading         = false;
-  let observer        = null;
+  // UX: mostra CHUNK_SIZE cards por vez na tela; a API entrega lotes maiores e
+  // o excedente fica num buffer em memória. Quando o buffer fica curto, dispara
+  // prefetch da próxima página em background — o usuário nunca espera no scroll.
+  const CHUNK_SIZE       = 8;
+  const PREFETCH_AT      = 8; // quando buffer.length <= PREFETCH_AT, prefetch
+  const categoria        = btn.dataset.categoria || '0';
+  const q                = btn.dataset.q || '';
+  const subtitle         = document.getElementById('products-subtitle');
+
+  let buffer        = [];           // produtos baixados e ainda não renderizados
+  let nextOffset    = parseInt(btn.dataset.offset, 10) || 0;
+  let serverHasMore = true;         // o backend ainda tem páginas?
+  let fetching      = null;         // Promise da requisição em voo (ou null)
+  let isInitial     = btn.dataset.initial === '1';
+  let totalShown    = 0;
+  let observer      = null;
 
   function teardown() {
     if (observer) { observer.disconnect(); observer = null; }
     wrap.remove();
   }
 
-  async function loadNextPage() {
-    if (loading) return;
-    loading         = true;
-    btn.disabled    = true;
-    btn.textContent = 'Carregando…';
+  function clearSkeleton() {
+    grid.querySelectorAll('.product-card--skeleton').forEach(el => el.remove());
+    grid.removeAttribute('aria-busy');
+  }
 
-    const offset    = parseInt(btn.dataset.offset, 10) || 0;
-    const categoria = btn.dataset.categoria || '0';
-    const q         = btn.dataset.q || '';
-    const params    = new URLSearchParams({ offset, categoria });
+  function updateSubtitle() {
+    if (!subtitle) return;
+    if (totalShown === 0 && !serverHasMore && buffer.length === 0) {
+      subtitle.textContent = 'Nenhum produto encontrado';
+    } else if (serverHasMore || buffer.length > 0) {
+      subtitle.textContent = `Exibindo ${totalShown} produtos`;
+    } else {
+      subtitle.textContent = `${totalShown} produto${totalShown !== 1 ? 's' : ''} encontrado${totalShown !== 1 ? 's' : ''}`;
+    }
+  }
+
+  // Faz UMA requisição à API e devolve os produtos. Não renderiza.
+  async function fetchNextPage() {
+    if (!serverHasMore || fetching) return fetching || Promise.resolve([]);
+    const params = new URLSearchParams({ offset: nextOffset, categoria });
     if (q) params.set('q', q);
 
-    try {
-      const res  = await fetch('/api/produtos.php?' + params.toString());
-      const data = await res.json();
-
-      if (!data?.ok || !Array.isArray(data.products)) throw new Error('API error');
-
-      data.products.forEach(p => {
-        const tmp = document.createElement('div');
-        tmp.innerHTML = renderProductCard(p);
-        grid.appendChild(tmp.firstElementChild);
-      });
-
-      if (data.has_more) {
-        btn.dataset.offset = data.next_offset;
-        btn.disabled       = false;
-        btn.textContent    = 'Ver mais produtos';
-      } else {
-        teardown();
+    fetching = (async () => {
+      try {
+        const res  = await fetch('/api/produtos.php?' + params.toString());
+        const data = await res.json();
+        if (!data?.ok || !Array.isArray(data.products)) throw new Error('API error');
+        nextOffset    = data.next_offset;
+        serverHasMore = !!data.has_more;
+        return data.products;
+      } catch (err) {
+        console.error('Erro ao carregar produtos:', err);
+        return [];
+      } finally {
+        fetching = null;
       }
-    } catch (err) {
-      btn.disabled    = false;
+    })();
+
+    return fetching;
+  }
+
+  // Renderiza até CHUNK_SIZE produtos do buffer no grid.
+  function renderChunkFromBuffer() {
+    const chunk = buffer.splice(0, CHUNK_SIZE);
+    if (chunk.length === 0) return 0;
+    const frag = document.createDocumentFragment();
+    chunk.forEach(p => {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = renderProductCard(p);
+      if (tmp.firstElementChild) frag.appendChild(tmp.firstElementChild);
+    });
+    grid.appendChild(frag);
+    totalShown += chunk.length;
+    return chunk.length;
+  }
+
+  // Garante que o buffer tem ao menos `min` produtos (busca quando necessário).
+  async function ensureBuffer(min) {
+    while (buffer.length < min && serverHasMore) {
+      const products = await fetchNextPage();
+      if (products.length === 0) break;
+      buffer = buffer.concat(products);
+    }
+  }
+
+  // Dispara prefetch em background sem bloquear (não awaita).
+  function maybePrefetch() {
+    if (buffer.length <= PREFETCH_AT && serverHasMore && !fetching) {
+      fetchNextPage().then(products => {
+        if (products.length) buffer = buffer.concat(products);
+      });
+    }
+  }
+
+  let loading = false;
+
+  // Mostra mais um chunk (do buffer, ou buscando se preciso).
+  async function showNextChunk() {
+    if (loading) return;
+    loading = true;
+    btn.disabled = true;
+    if (!isInitial) btn.textContent = 'Carregando…';
+
+    try {
+      if (buffer.length < CHUNK_SIZE) {
+        await ensureBuffer(CHUNK_SIZE);
+      }
+
+      if (isInitial) clearSkeleton();
+
+      const rendered = renderChunkFromBuffer();
+      isInitial = false;
+      btn.dataset.initial = '0';
+
+      updateSubtitle();
+
+      const stillHasContent = buffer.length > 0 || serverHasMore;
+      if (!stillHasContent && rendered === 0 && totalShown === 0) {
+        // nenhum produto disponível
+        teardown();
+        return;
+      }
+      if (!stillHasContent) {
+        teardown();
+        return;
+      }
+
+      btn.disabled = false;
+      btn.style.visibility = '';
       btn.textContent = 'Ver mais produtos';
-      console.error('Erro ao carregar mais produtos:', err);
+
+      // Prefetch da próxima página enquanto o usuário olha a atual.
+      maybePrefetch();
+    } catch (err) {
+      if (isInitial) {
+        clearSkeleton();
+        if (subtitle) subtitle.textContent = 'Erro ao carregar produtos. Tente recarregar a página.';
+      }
+      btn.disabled = false;
+      btn.style.visibility = '';
+      btn.textContent = 'Ver mais produtos';
+      console.error('Erro ao mostrar produtos:', err);
     } finally {
       loading = false;
     }
   }
 
-  btn.addEventListener('click', loadNextPage);
+  btn.addEventListener('click', showNextChunk);
 
-  // Auto-trigger when the button scrolls into view (200 px before it becomes visible).
-  // Falls back to click-only on browsers without IntersectionObserver support.
+  // Primeira carga: começa imediatamente.
+  showNextChunk();
+
+  // Auto-trigger ao rolar até perto do botão.
   if ('IntersectionObserver' in window) {
     observer = new IntersectionObserver(
-      (entries) => { if (entries[0].isIntersecting && !loading && !btn.disabled) loadNextPage(); },
-      { rootMargin: '200px 0px' }
+      (entries) => { if (entries[0].isIntersecting && !loading && !btn.disabled) showNextChunk(); },
+      { rootMargin: '400px 0px' }
     );
     observer.observe(btn);
   }
@@ -1015,7 +1418,11 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('mobile-cart-btn')?.addEventListener('click',   () => CartSidebar.toggle());
 
   // Checkout link in cart
-  document.getElementById('cart-checkout-link')?.addEventListener('click', () => { CartSidebar.close(); window.location.href = '/checkout.php'; });
+  document.getElementById('cart-checkout-link')?.addEventListener('click', async () => {
+    CartSidebar.close();
+    try { if (typeof flushAllPendingCartUpserts === 'function') await flushAllPendingCartUpserts(); } catch (_) {}
+    window.location.href = '/checkout.php';
+  });
 
   // Search form (sidebar)
   document.getElementById('search-submit')?.addEventListener('click', doSearch);

@@ -1,5 +1,8 @@
 <?php
 // head.php — Common <head> block for all pages
+require_once __DIR__ . '/csrf.php';
+csrf_session_start();
+$_csrf_token = csrf_token();
 $page_title = isset($page_title) ? $page_title . ' | Spark Eletrônica' : 'Spark Eletrônica';
 $_css_v = @filemtime(dirname(__DIR__) . '/assets/css/style.css') ?: '';
 ?>
@@ -8,6 +11,7 @@ $_css_v = @filemtime(dirname(__DIR__) . '/assets/css/style.css') ?: '';
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="csrf-token" content="<?= htmlspecialchars($_csrf_token, ENT_QUOTES, 'UTF-8') ?>">
   <title><?= htmlspecialchars($page_title) ?></title>
   <meta name="description" content="<?= htmlspecialchars($page_desc ?? 'Spark Eletrônica - Soluções em eletrônica e energia') ?>">
   <link rel="icon" href="/assets/images/produtos/logo.png" type="image/png">
@@ -25,7 +29,7 @@ $_css_v = @filemtime(dirname(__DIR__) . '/assets/css/style.css') ?: '';
           $preload_image_jpg=jpg URL → emits href=jpg + imagesrcset=webp + type=image/webp.
        b) Single proxied image (product detail card): only $preload_image set →
           emits href=URL with no imagesrcset/type (avoids type-mismatch warnings).
-       fetchpriority="high" is emitted ONLY when the source URL passes the
+       fetchpriority="low" is emitted ONLY when the source URL passes the
        low-resolution check — local site assets and verified low-res variants
        qualify; any URL marked or unmarkable as low is downgraded (omits the
        attribute and lets the browser choose). */
@@ -39,7 +43,7 @@ $_css_v = @filemtime(dirname(__DIR__) . '/assets/css/style.css') ?: '';
         href="<?= htmlspecialchars($_pre_href) ?>"
         <?php if ($_pre_srcset !== ''): ?>imagesrcset="<?= htmlspecialchars($_pre_srcset) ?>"<?php endif; ?>
         <?php if ($_pre_type !== ''): ?>type="<?= htmlspecialchars($_pre_type) ?>"<?php endif; ?>
-        <?php if ($_pre_high): ?>fetchpriority="high"<?php endif; ?>
+        <?php if ($_pre_high): ?>fetchpriority="low"<?php endif; ?>
         <?php if (!empty($preload_image_media)): ?>media="<?= htmlspecialchars($preload_image_media) ?>"<?php endif; ?>>
 <?php endif; ?>
 
@@ -53,6 +57,7 @@ $_css_v = @filemtime(dirname(__DIR__) . '/assets/css/style.css') ?: '';
     window.APP_SB_URL      = <?= json_encode(SUPABASE_URL) ?>;
     window.APP_SB_ANON     = <?= json_encode(SUPABASE_ANON_KEY) ?>;
     window.APP_CEP_ORIGEM  = <?= json_encode(defined('CEP_ORIGEM') ? CEP_ORIGEM : '') ?>;
+    window.APP_CSRF_TOKEN  = <?= json_encode($_csrf_token) ?>;
   </script>
 </head>
 <body>

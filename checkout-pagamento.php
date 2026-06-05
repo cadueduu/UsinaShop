@@ -347,6 +347,7 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $enderecoIdReq = trim((string)($body['endereco_id'] ?? ''));
     $shippingCode  = preg_replace('/\D/', '', (string)($body['shipping_code'] ?? ''));
+    $shippingValorClient = $body['shipping_valor'] ?? null;
 
     if ($enderecoIdReq === '' || !is_numeric($enderecoIdReq) || intval($enderecoIdReq) <= 0) {
         http_response_code(400);
@@ -361,6 +362,21 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $enderecoIdInt = intval($enderecoIdReq);
 
     try {
+        $parseBrl = function ($raw): ?float {
+            if ($raw === null) return null;
+            $s = trim(str_replace(['R$', ' '], '', (string)$raw));
+            if ($s === '') return null;
+            if (str_contains($s, ',') && str_contains($s, '.')) {
+                $s = str_replace('.', '', $s);
+                $s = str_replace(',', '.', $s);
+            } elseif (str_contains($s, ',')) {
+                $s = str_replace(',', '.', $s);
+            }
+            if (!is_numeric($s)) return null;
+            $n = floatval($s);
+            return (is_finite($n) && $n >= 0) ? $n : null;
+        };
+
         // ── Validate address ownership ────────────────────────────────────────
         $enderecoRows = sb('endereco', [
             'id'         => 'eq.' . $enderecoIdInt,
@@ -382,7 +398,7 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         // ── Read cart from database ───────────────────────────────────────────
         $cartRows = sb('carrinho', [
             'cliente_id' => 'eq.' . $clienteId,
-            'select'     => 'codprod,quantidade',
+            'select'     => 'codprod,quantidade,peso_total',
         ], 'GET', null, SUPABASE_SERVICE_KEY);
         if (empty($cartRows)) {
             http_response_code(400);
@@ -403,7 +419,7 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         $batchData = sb_multi([
             'preco'   => ['preco',   ['codprod' => $in, 'select' => 'codprod,vlr_venda'],          'GET', null, SUPABASE_SERVICE_KEY],
             'estoque' => ['estoque', ['codprod' => $in, 'select' => 'codprod,estoque_disponivel'], 'GET', null, SUPABASE_SERVICE_KEY],
-            'produto' => ['produto', ['codprod' => $in, 'select' => 'codprod,comnome,descrprod,peso,altura,largura,comprimento'], 'GET', null, SUPABASE_SERVICE_KEY],
+            'produto' => ['produto', ['codprod' => $in, 'select' => 'codprod,comnome,descrprod,peso,altura,largura,comprimento,codprodemb'], 'GET', null, SUPABASE_SERVICE_KEY],
         ]);
 
         $precoMap   = [];
@@ -412,6 +428,24 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         foreach ($batchData['estoque'] ?? [] as $r) { $estoqueMap[intval($r['codprod'])] = floatval($r['estoque_disponivel']   ?? 0); }
         $produtoMap = [];
         foreach ($batchData['produto'] ?? [] as $r) { $produtoMap[intval($r['codprod'])] = $r; }
+
+        $embIds = [];
+        foreach ($produtoMap as $p) {
+            $eid = intval($p['codprodemb'] ?? 0);
+            if ($eid > 0) $embIds[] = $eid;
+        }
+        $embIds = array_values(array_unique($embIds));
+        $embalagemMap = [];
+        if (!empty($embIds)) {
+            $embIn = 'in.(' . implode(',', $embIds) . ')';
+            $embRows = sb('embalagem', [
+                'codprod' => $embIn,
+                'select'  => 'codprod,peso,altura,largura,comprimento',
+            ], 'GET', null, SUPABASE_SERVICE_KEY);
+            foreach ($embRows as $er) {
+                $embalagemMap[intval($er['codprod'] ?? 0)] = $er;
+            }
+        }
 
         // ── Validate each item and compute order totals ───────────────────────
         $mpItems        = [];
@@ -449,12 +483,24 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             if ($title === '') $title = 'Produto #' . $pid;
 
-            $pesoUnit   = floatval(is_array($prod) ? ($prod['peso']        ?? 0.3)  : 0.3);
-            $alt        = floatval(is_array($prod) ? ($prod['altura']      ?? 10.0) : 10.0);
-            $larg       = floatval(is_array($prod) ? ($prod['largura']     ?? 15.0) : 15.0);
-            $comp       = floatval(is_array($prod) ? ($prod['comprimento'] ?? 20.0) : 20.0);
+            $embCode    = intval(is_array($prod) ? ($prod['codprodemb']    ?? 0)    : 0);
+            $emb        = $embCode > 0 ? ($embalagemMap[$embCode] ?? null) : null;
+        if ($embCode <= 0 || !is_array($emb)) {
+            http_response_code(400);
+            echo json_encode(['ok' => false, 'error' => 'Produto sem embalagem configurada.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        $embPeso = floatval($emb['peso'] ?? 0);
+        $alt     = floatval($emb['altura'] ?? 0);
+        $larg    = floatval($emb['largura'] ?? 0);
+        $comp    = floatval($emb['comprimento'] ?? 0);
+        if (!is_finite($embPeso) || $embPeso <= 0 || !is_finite($alt) || $alt <= 0 || !is_finite($larg) || $larg <= 0 || !is_finite($comp) || $comp <= 0) {
+            http_response_code(400);
+            echo json_encode(['ok' => false, 'error' => 'Embalagem inválida para um ou mais produtos.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
 
-            $pesoGramas     += max(1, (int)round($pesoUnit * $qty * 1000));
+        $pesoGramas += max(1, (int)round($embPeso * $qty * 1000));
             $maxAltura       = max($maxAltura,      (int)ceil(max(1.0, $alt)));
             $maxLargura      = max($maxLargura,     (int)ceil(max(1.0, $larg)));
             $maxComprimento  = max($maxComprimento, (int)ceil(max(1.0, $comp)));
@@ -506,8 +552,8 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         if (is_array($freteItem)) {
             $raw = $freteItem['pcTotal'] ?? $freteItem['pcFinal'] ?? $freteItem['pcServico'] ?? $freteItem['pcBase'] ?? null;
             if ($raw !== null) {
-                $n = floatval(str_replace(',', '.', (string)$raw));
-                if (is_finite($n) && $n > 0) $freteVal = $n;
+                $n = $parseBrl($raw);
+                if ($n !== null && $n > 0) $freteVal = $n;
             }
         }
         if ($freteVal === null || $freteVal <= 0) {
@@ -515,7 +561,14 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             echo json_encode(['ok' => false, 'error' => 'Não foi possível calcular o frete. Verifique o CEP e tente novamente.'], JSON_UNESCAPED_UNICODE);
             exit;
         }
-        $totalGeral = round($subtotal + $freteVal, 2);
+
+        $clientVal = $parseBrl($shippingValorClient);
+        $freteAplicado = $freteVal;
+        if ($clientVal !== null && $clientVal > 0) {
+            $freteAplicado = max($freteAplicado, $clientVal);
+        }
+        $freteAplicado = round($freteAplicado, 2);
+        $totalGeral = round($subtotal + $freteAplicado, 2);
 
         // ── Resolve base URL ──────────────────────────────────────────────────
         $baseUrl = defined('APP_BASE_URL') ? APP_BASE_URL : '';
@@ -553,7 +606,7 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             'endereco_id'      => $enderecoIdInt,
             'status'           => 'pendente',
             'metodo_pagamento' => 'mercadopago',
-            'vlr_frete'        => round($freteVal, 2),
+            'vlr_frete'        => $freteAplicado,
             'vlr_total'        => $totalGeral,
         ], SUPABASE_SERVICE_KEY);
 
@@ -622,7 +675,7 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         $mpRequest  = [
             'external_reference' => (string)$pedidoId,
             'items'              => $mpItems,
-            'shipments'          => ['cost' => max(0, $freteVal), 'mode' => 'not_specified'],
+            'shipments'          => ['cost' => max(0, $freteAplicado), 'mode' => 'not_specified'],
             'payment_methods'    => ['excluded_payment_types' => $excludedPaymentTypes],
             'notification_url'   => str_starts_with($baseUrl, 'https://') ? ($baseUrl . '/checkout-pagamento.php?action=mp-webhook') : null,
             'back_urls'          => ['success' => $successUrl, 'pending' => $returnUrl, 'failure' => $returnUrl],
@@ -662,6 +715,8 @@ if ($action === 'mp-preference' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             'init_point'    => $initPoint,
             'pedido_id'     => $pedidoId,
             'preference_id' => $preference->id ?? null,
+            'frete_calculado' => round($freteVal, 2),
+            'frete_aplicado'  => $freteAplicado,
         ], JSON_UNESCAPED_UNICODE);
         exit;
 
@@ -914,7 +969,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     return String(data.cep).replace(/\D/g, '');
   }
 
-  async function loadShippingOptions() {
+  async function loadShippingOptions(preserveCode = null) {
     const cepDestino = await resolveCepDestino();
     if (!cepDestino || cepDestino.length !== 8) {
       shippingNoteEl.innerText = 'CEP inválido. Não foi possível calcular o frete.';
@@ -932,19 +987,28 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (cepOrigem.length !== 8) throw new Error('cep_origem_invalido');
 
       const cartItemsFull = (typeof Cart !== 'undefined') ? Cart.getAll() : [];
-      const pesoGramas = Math.max(1, Math.round(cartItemsFull.reduce((s, it) => {
-        const pesoTotal = (it.pesoTotal != null) ? parseFloat(it.pesoTotal) : (parseFloat(it.peso || 0.3) * (parseInt(it.qty, 10) || 1));
-        return s + (isFinite(pesoTotal) ? pesoTotal : 0) * 1000;
-      }, 0))) || 300;
-      const altura = Math.max(1, ...cartItemsFull.map(it => parseFloat((it.embAltura ?? it.altura) || 10)));
-      const largura = Math.max(1, ...cartItemsFull.map(it => parseFloat((it.embLargura ?? it.largura) || 15)));
-      const comprimento = Math.max(1, ...cartItemsFull.map(it => parseFloat((it.embComprimento ?? it.comprimento) || 20)));
+      const missingPack = cartItemsFull.filter(it => !((it.embPeso > 0) && (it.embAltura > 0) && (it.embLargura > 0) && (it.embComprimento > 0)));
+      if (missingPack.length) throw new Error('embalagem_incompleta');
+
+      const pesoGramas = Math.max(300, Math.round(cartItemsFull.reduce((s, it) => {
+        const qty = parseInt(it.qty, 10) || 1;
+        return s + (parseFloat(it.embPeso) * qty * 1000);
+      }, 0)));
+      const altura = Math.max(1, ...cartItemsFull.map(it => parseFloat(it.embAltura)));
+      const largura = Math.max(1, ...cartItemsFull.map(it => parseFloat(it.embLargura)));
+      const comprimento = Math.max(1, ...cartItemsFull.map(it => parseFloat(it.embComprimento)));
 
       function parsePrecoItem(item) {
         if (!item || typeof item !== 'object') return null;
         const raw = item.pcTotal ?? item.pcFinal ?? item.pcServico ?? item.pcBase ?? null;
         if (raw == null) return null;
-        const n = parseFloat(String(raw).replace(',', '.'));
+        let s = String(raw).replace('R$', '').trim();
+        if (s.includes(',') && s.includes('.')) {
+          s = s.replace(/\./g, '').replace(',', '.');
+        } else if (s.includes(',')) {
+          s = s.replace(',', '.');
+        }
+        const n = parseFloat(s);
         return isFinite(n) ? n : null;
       }
 
@@ -1002,8 +1066,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       shippingOptionsMap = nextMap;
       renderShippingButtons();
-      selectedShippingCode = null;
-      shippingPrice = 0;
+      const keep = preserveCode || selectedShippingCode;
+      if (keep && shippingOptionsMap[keep] && !shippingOptionsMap[keep].disabled) {
+        selectedShippingCode = keep;
+        shippingPrice = shippingOptionsMap[keep].valor || 0;
+      } else {
+        selectedShippingCode = null;
+        shippingPrice = 0;
+      }
       syncShippingUI();
       updateTotals();
       if (okCount < servicos.length) {
@@ -1012,7 +1082,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         shippingNoteEl.innerText = 'Selecione uma opção de frete.';
       }
     } catch (e) {
-      shippingNoteEl.innerText = 'Erro ao calcular frete.';
+      if (String(e?.message || '').includes('embalagem_incompleta')) {
+        shippingNoteEl.innerText = 'Não foi possível calcular o frete: há produto(s) sem embalagem configurada.';
+      } else {
+        shippingNoteEl.innerText = 'Erro ao calcular frete.';
+      }
       shippingOptionsMap = {};
       selectedShippingCode = null;
       shippingPrice = 0;
@@ -1031,6 +1105,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateTotals();
   renderShippingButtons();
   syncShippingUI();
+  window.SparkShipping = {
+    refresh: async (code = null) => loadShippingOptions(code),
+    getSelectedCode: () => selectedShippingCode,
+    getSelectedValor: () => shippingPrice,
+  };
   loadShippingOptions();
 });
 
@@ -1055,7 +1134,7 @@ async function finalizarCompra() {
   }
 
   const sb = getSB();
-  if (!sb) { alert('Erro de conexão.'); return; }
+  if (!sb) { alert('Não foi possível conectar ao servidor. Verifique sua internet e tente novamente.'); return; }
 
   const { data: { session } } = await sb.auth.getSession();
   if (!session) { window.location.href = '/login.php?redirect=/checkout.php'; return; }
@@ -1068,6 +1147,15 @@ async function finalizarCompra() {
   btn.style.opacity = '0.7';
 
   try {
+    if (window.flushAllPendingCartUpserts) {
+      try { await window.flushAllPendingCartUpserts(); } catch (_) {}
+    }
+    if (window.SparkShipping?.refresh) {
+      await window.SparkShipping.refresh(selectedShippingCode);
+    }
+    if (!selectedShippingCode || !shippingOptionsMap[selectedShippingCode] || shippingOptionsMap[selectedShippingCode].disabled) {
+      throw new Error('Selecione uma opção de frete para continuar.');
+    }
     const mpRes = await fetch('/checkout-pagamento.php?action=mp-preference', {
       method: 'POST',
       headers: {
@@ -1077,10 +1165,16 @@ async function finalizarCompra() {
       body: JSON.stringify({
         endereco_id: String(enderecoId),
         shipping_code: selectedShippingCode,
+        shipping_valor: Number(shippingPrice || 0).toFixed(2),
       }),
     });
     const mpData = await mpRes.json().catch(() => null);
     if (!mpRes.ok || !mpData?.ok || !mpData?.init_point) {
+      if (mpRes.status === 409 && mpData?.debug) {
+        const sel = mpData.debug.frete_selecionado ?? null;
+        const calc = mpData.debug.frete_calculado ?? null;
+        throw new Error(`O valor do frete mudou (selecionado: R$ ${sel}, calculado: R$ ${calc}). Recalcule o frete e tente novamente.`);
+      }
       throw new Error(mpData?.error || 'Erro ao criar pedido.');
     }
 
@@ -1091,7 +1185,7 @@ async function finalizarCompra() {
     btn.innerText = 'Confirmar Pagamento';
     btn.disabled = false;
     btn.style.opacity = '1';
-    alert(e?.message || 'Erro ao finalizar pedido. Tente novamente.');
+    alert(String(e?.message || 'Não foi possível finalizar o pedido agora. Verifique sua conexão e tente novamente em instantes.'));
   }
 }
 </script>

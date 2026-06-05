@@ -1,9 +1,18 @@
 <?php
 require_once __DIR__ . '/includes/config.php';
+require_once __DIR__ . '/includes/csrf.php';
+csrf_session_start();
 
 $action = (string)($_GET['action'] ?? '');
 if ($action === 'mp-confirm' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
+
+    if (!csrf_validate_request()) {
+        http_response_code(403);
+        echo json_encode(['ok' => false, 'error' => 'Token de sessão inválido. Recarregue a página e tente novamente.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
     $body = json_decode(file_get_contents('php://input'), true);
     if (!is_array($body)) $body = [];
 
@@ -286,7 +295,10 @@ async function handleMpReturn() {
   try {
     const res = await fetch('/conta.php?action=mp-confirm', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': window.APP_CSRF_TOKEN || ''
+      },
       body: JSON.stringify({ payment_id: paymentId, external_reference: externalRef })
     });
     const data = await res.json().catch(() => null);
@@ -474,7 +486,7 @@ async function saveEditAddr(id) {
     cidade:      get('cidade'),
     uf:          get('uf').toUpperCase().slice(0, 2),
   }).eq('id', id);
-  if (error) { errEl.textContent = 'Erro ao salvar.'; errEl.style.display = 'block'; return; }
+  if (error) { errEl.textContent = 'Não foi possível salvar agora. Verifique sua conexão e tente novamente.'; errEl.style.display = 'block'; return; }
   await loadAcctAddresses();
 }
 
@@ -517,7 +529,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const errEl = document.getElementById('profile-error');
     const okEl  = document.getElementById('profile-success');
     const { error } = await sb.from('cliente').update({ nome, telefone }).eq('id', session.user.id);
-    if (error) { errEl.textContent = 'Erro ao salvar.'; errEl.style.display = 'block'; return; }
+    if (error) { errEl.textContent = 'Não foi possível salvar agora. Verifique sua conexão e tente novamente.'; errEl.style.display = 'block'; return; }
     document.getElementById('pf-name').textContent  = nome;
     document.getElementById('pf-phone').textContent = fmtPhone(telefone);
     okEl.style.display = 'block';
@@ -554,7 +566,7 @@ document.addEventListener('DOMContentLoaded', () => {
       cidade: get('cidade'), uf: get('uf').toUpperCase().slice(0,2),
       is_padrao: isFirst,
     });
-    if (error) { const e = document.getElementById('acct-addr-error'); e.textContent='Erro ao salvar.'; e.style.display='block'; return; }
+    if (error) { const e = document.getElementById('acct-addr-error'); e.textContent='Não foi possível salvar o endereço. Verifique sua conexão e tente novamente.'; e.style.display='block'; return; }
     document.getElementById('acct-new-addr-form').style.display = 'none';
     await loadAcctAddresses();
   });

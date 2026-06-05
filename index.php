@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/includes/config.php';
+require_once __DIR__ . '/includes/featured.php';
 
 // Search query
 $search = trim($_GET['q'] ?? '');
@@ -26,8 +27,8 @@ if ($is_search) {
     // listing_mode=true: skips specs, filters unavailable before image fetch, returns filtered list.
     $search_results = enrich_products(array_values($merged), true);
 } else {
-    $destaques    = fetch_products([], 8);
-    $mais_vendidos= fetch_products(['order'=>'codprod.desc'], 8);
+    $destaques     = fetch_highlights(8);
+    $mais_vendidos = fetch_best_sellers(8);
 }
 
 // Banner slides configuration. `image` is the basename without extension —

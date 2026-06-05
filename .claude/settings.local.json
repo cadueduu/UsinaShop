@@ -52,7 +52,18 @@
       "Bash(gh repo *)",
       "PowerShell(gh repo view shiruikhan/Repositorio_Spark --json name,description,defaultBranchRef,url 2>&1)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(Get-ChildItem -Path \"c:\\\\util\\\\P4\" -Force)",
+      "Bash(Select-Object Name, PSIsContainer)",
+      "Bash(php -l includes/csrf.php)",
+      "Bash(php -l includes/head.php)",
+      "Bash(php -l includes/config.php)",
+      "Bash(php -l conta.php)",
+      "Bash(php -l checkout-pagamento.php)",
+      "Bash(node --check assets/js/main.js)",
+      "Bash(dir /B C:\\\\util\\\\P4)",
+      "PowerShell(Get-ChildItem -Path C:\\\\util\\\\P4 -Force | Select-Object Name, @{Name=\"Type\";Expression={if \\($_.PSIsContainer\\) {\"DIR\"} else {\"FILE\"}}} | Format-Table -AutoSize)",
+      "PowerShell(php -l C:\\\\util\\\\P4\\\\includes\\\\config.php)"
     ]
   }
 }

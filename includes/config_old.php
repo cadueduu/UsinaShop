@@ -84,6 +84,8 @@ $local_mode_env = getenv('LOCAL_DATA_MODE');
 define('LOCAL_DATA_MODE', $local_mode_env !== false && in_array(strtolower($local_mode_env), ['1', 'true', 'yes'], true));
 
 // Guard: LOCAL_DATA_MODE must never be active alongside production credentials.
+// If it is, all sb() calls silently route to the local JSON file instead of
+// Supabase, breaking the live store without any visible error.
 if (LOCAL_DATA_MODE && (MP_ACCESS_TOKEN !== '' || SUPABASE_SERVICE_KEY !== '')) {
     error_log(
         '[SPARK CRITICAL] LOCAL_DATA_MODE=true is set while production credentials ' .
@@ -296,6 +298,7 @@ function sb($endpoint, $params = [], $method = 'GET', $body = null, $token = nul
     if (!empty($params)) {
         $parts = [];
         foreach ($params as $k => $v) {
+            // select and order values contain special chars (parens, commas) that PostgREST expects unencoded
             if (in_array($k, ['select', 'order'], true)) {
                 $parts[] = rawurlencode($k) . '=' . $v;
             } else {
@@ -335,6 +338,7 @@ function sb($endpoint, $params = [], $method = 'GET', $body = null, $token = nul
 
     $decoded = json_decode($resp, true);
 
+    // PostgREST retorna objeto com "code"+"message" em caso de erro
     if (is_array($decoded) && isset($decoded['code'], $decoded['message']) && !isset($decoded[0])) {
         error_log("[Supabase $httpCode] {$decoded['code']}: {$decoded['message']} | URL: $url");
         return [];
@@ -344,6 +348,8 @@ function sb($endpoint, $params = [], $method = 'GET', $body = null, $token = nul
 }
 
 // ─── Helper: Parallel Supabase REST calls via curl_multi ─────────────────────
+// $queries: assoc array of [ key => [$endpoint, $params, $method, $body, $token, $extra_headers] ]
+// Returns: assoc array [ key => result_array ]
 function sb_multi(array $queries): array
 {
     if (LOCAL_DATA_MODE) {
@@ -435,148 +441,27 @@ function sb_multi(array $queries): array
     return $results;
 }
 
-// Emails autorizados a acessar o /admin. Adicione mais entradas conforme necessário.
-const ADMIN_EMAILS = ['ti01@spark.ind.br'];
-
-function admin_resolve_token(): string
+function admin_require_basic_auth(): void
 {
-    $auth = (string)($_SERVER['HTTP_AUTHORIZATION'] ?? '');
-    if ($auth === '' && function_exists('apache_request_headers')) {
-        $hs = apache_request_headers();
-        foreach ($hs as $k => $v) {
-            if (strcasecmp($k, 'Authorization') === 0) {
-                $auth = (string)$v;
-                break;
-            }
-        }
-    }
-    if (stripos($auth, 'Bearer ') === 0) {
-        $tok = trim(substr($auth, 7));
-        if ($tok !== '') return $tok;
-    }
-    $cookie = (string)($_COOKIE['sb_token'] ?? '');
-    return $cookie;
-}
+    $user = getenv('ADMIN_USER');
+    $pass = getenv('ADMIN_PASS');
+    $user = ($user !== false) ? (string)$user : '';
+    $pass = ($pass !== false) ? (string)$pass : '';
 
-function admin_lookup_user_email(string $token): string
-{
-    if ($token === '' || SUPABASE_URL === '' || SUPABASE_ANON_KEY === '') return '';
-    $ch = curl_init(SUPABASE_URL . '/auth/v1/user');
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER     => [
-            'apikey: ' . SUPABASE_ANON_KEY,
-            'Authorization: Bearer ' . $token,
-        ],
-        CURLOPT_TIMEOUT        => 5,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2,
-    ]);
-    $resp = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    if ($code !== 200) return '';
-    $data = json_decode((string)$resp, true);
-    return strtolower(trim((string)($data['email'] ?? '')));
-}
-
-function admin_is_admin_request(): bool
-{
-    $token = admin_resolve_token();
-    if ($token === '') return false;
-    $email = admin_lookup_user_email($token);
-    if ($email === '') return false;
-    foreach (ADMIN_EMAILS as $allowed) {
-        if (hash_equals(strtolower(trim($allowed)), $email)) return true;
-    }
-    return false;
-}
-
-function admin_require_admin_user(): void
-{
-    if (admin_is_admin_request()) return;
-
-    // AJAX requests get a JSON 401
-    $accept = (string)($_SERVER['HTTP_ACCEPT'] ?? '');
-    $is_ajax = stripos($accept, 'application/json') !== false
-        || strtolower((string)($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest'
-        || ($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET';
-    if ($is_ajax) {
-        http_response_code(401);
-        header('Content-Type: application/json; charset=utf-8');
-        echo json_encode(['ok' => false, 'error' => 'Acesso restrito.'], JSON_UNESCAPED_UNICODE);
+    if ($user === '' || $pass === '') {
+        http_response_code(503);
+        echo 'Admin não configurado.';
         exit;
     }
 
-    // HTML: show a tiny gate page that signs in via Supabase JS, then reloads.
-    http_response_code(401);
-    header('Content-Type: text/html; charset=utf-8');
-    $sb_url  = json_encode(SUPABASE_URL);
-    $sb_anon = json_encode(SUPABASE_ANON_KEY);
-    echo <<<HTML
-<!doctype html><html lang="pt-BR"><head><meta charset="UTF-8">
-<title>Admin · Login</title>
-<link rel="stylesheet" href="/assets/css/style.css">
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-</head><body>
-<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;padding:1rem;">
-  <form id="admin-login" style="background:#fff;padding:2rem;border-radius:12px;width:100%;max-width:360px;box-shadow:0 10px 30px rgba(0,0,0,.3);display:flex;flex-direction:column;gap:.75rem;">
-    <h1 style="font-size:1.25rem;font-weight:700;color:#111;margin-bottom:.5rem;">Acesso restrito</h1>
-    <p style="font-size:.8125rem;color:#6b7280;margin-bottom:.5rem;">Faça login com o e-mail autorizado.</p>
-    <input id="ae" type="email" placeholder="E-mail" required autofocus
-      style="padding:.65rem .75rem;border:1px solid #e5e7eb;border-radius:8px;font-size:.9rem;">
-    <input id="ap" type="password" placeholder="Senha" required
-      style="padding:.65rem .75rem;border:1px solid #e5e7eb;border-radius:8px;font-size:.9rem;">
-    <button type="submit"
-      style="padding:.7rem;background:#facc15;color:#000;font-weight:700;border:none;border-radius:8px;cursor:pointer;">
-      Entrar
-    </button>
-    <div id="aerr" style="color:#dc2626;font-size:.8125rem;min-height:1rem;"></div>
-  </form>
-</div>
-<script>
-(async () => {
-  const SB_URL = {$sb_url};
-  const SB_ANON = {$sb_anon};
-  const sb = supabase.createClient(SB_URL, SB_ANON);
-
-  function setTokenCookie(tok) {
-    const secure = location.protocol === 'https:' ? '; Secure' : '';
-    document.cookie = 'sb_token=' + (tok || '') + '; Path=/; SameSite=Lax; Max-Age=' + (tok ? 3600 : 0) + secure;
-  }
-
-  // If already signed in (e.g. via /conta.php), set cookie and reload once.
-  const { data: { session } } = await sb.auth.getSession();
-  if (session?.access_token && !sessionStorage.getItem('admin_retry')) {
-    setTokenCookie(session.access_token);
-    sessionStorage.setItem('admin_retry', '1');
-    location.reload();
-    return;
-  }
-  sessionStorage.removeItem('admin_retry');
-
-  document.getElementById('admin-login').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const err = document.getElementById('aerr');
-    err.textContent = '';
-    const email = document.getElementById('ae').value.trim();
-    const password = document.getElementById('ap').value;
-    const { data, error } = await sb.auth.signInWithPassword({ email, password });
-    if (error) { err.textContent = error.message; return; }
-    setTokenCookie(data.session.access_token);
-    location.reload();
-  });
-})();
-</script>
-</body></html>
-HTML;
-    exit;
-}
-
-// Backwards-compatible alias for the previous Basic Auth gate.
-function admin_require_basic_auth(): void
-{
-    admin_require_admin_user();
+    $inUser = (string)($_SERVER['PHP_AUTH_USER'] ?? '');
+    $inPass = (string)($_SERVER['PHP_AUTH_PW'] ?? '');
+    if (!hash_equals($user, $inUser) || !hash_equals($pass, $inPass)) {
+        header('WWW-Authenticate: Basic realm="Admin"');
+        http_response_code(401);
+        echo 'Auth requerida.';
+        exit;
+    }
 }
 
 // ─── Helper: Format product display name ─────────────────────────────────────
@@ -638,6 +523,10 @@ function fmt_brl($value)
 }
 
 // ─── Helper: Strict low-resolution URL validator ─────────────────────────────
+// Defense-in-depth check at the render boundary:
+//   - Local site paths (/assets/...): pass through (no low/high semantics).
+//   - Remote URLs: path must contain a 'low' whole-word AND no 'high' whole-word.
+// Word boundaries: / _ - . and start/end of path segment.
 function is_low_resolution_image_url(string $url): bool
 {
     if ($url === '') return false;
@@ -650,24 +539,31 @@ function is_low_resolution_image_url(string $url): bool
 }
 
 // ─── Helper: Get product image URL (strict low-only) ─────────────────────────
+// Drops any image entry whose URL is not a verified low-resolution asset; the
+// first remaining entry (by ordem) is returned. If nothing qualifies, the
+// shared fallback logo is returned so the UI never renders a high-res variant.
 function prod_img($images)
 {
     if (empty($images)) return '/assets/images/produtos/logo.png';
     usort($images, fn($a, $b) => ($a['ordem'] ?? 999) - ($b['ordem'] ?? 999));
     foreach ($images as $img) {
+        // New shape: reject any path that explicitly marks itself as high-res.
+        // The authoritative low/high signal is ext_product_images.resolution_type,
+        // already enforced server-side by db_products_images_low_bulk(); the path
+        // check here is defense-in-depth against a mis-labeled row, NOT a second
+        // gate that requires the path to carry a `_low_` token (legacy uploads
+        // often don't, and rejecting them silently hides valid products).
         if (!empty($img['path'])) {
+            $p = (string)$img['path'];
+            if (preg_match('/(^|[\/_.\-])high([\/_.\-]|$)/i', $p)) continue;
             $url = product_image_render_url($img, 400, 60, 'webp');
             if ($url !== '') return $url;
             continue;
         }
+        // Legacy / LOCAL_DATA_MODE: full URL stored.
         $url = (string)($img['url'] ?? '');
-        if ($url === '') continue;
-        if (is_low_resolution_image_url($url)) return $url;
-        $path = supabase_path_from_public_url($url);
-        if ($path !== '') {
-            $render = supabase_image_url($path, 400, 60, 'webp');
-            if ($render !== '') return $render;
-        }
+        if ($url === '' || !is_low_resolution_image_url($url)) continue;
+        return $url;
     }
     return '/assets/images/produtos/logo.png';
 }
@@ -681,6 +577,24 @@ function supabase_storage_public_url(string $bucket, string $path): string
 }
 
 // ─── Helper: Supabase Image Transformation URL ───────────────────────────────
+// Build a URL that asks Supabase to resize / re-encode the image on the edge
+// and serve it from its CDN. No PHP I/O, no local proxy, no disk cache — every
+// (path, width, quality, format) tuple is cached at the CDN layer.
+//
+// URL shape:
+//   {SUPABASE_URL}/storage/v1/render/image/public/{SUPABASE_BUCKET}/{path}
+//     ?width={width}&quality={quality}&format={format}
+//
+// Example:
+//   https://abc.supabase.co/storage/v1/render/image/public/product-assets/
+//     1234/foto_low_0.jpg?width=400&quality=60&format=webp
+//
+// Notes:
+// - `render/image` (not `object`) is the transcoding endpoint.
+// - `format=webp` typically saves 25–35% vs JPEG at quality=60 with no visible loss;
+//   pass `format=origin` to skip re-encoding and keep the source bytes.
+// - Aspect ratio is preserved when only `width` is supplied.
+// - Requires the Image Transformations add-on (Supabase Pro plan and above).
 function supabase_image_url(
     string $imagePath,
     int    $width   = 400,
@@ -689,6 +603,7 @@ function supabase_image_url(
 ): string {
     if ($imagePath === '' || SUPABASE_URL === '' || SUPABASE_BUCKET === '') return '';
 
+    // Encode each segment so spaces/accents survive, but preserve '/' as a separator.
     $clean   = ltrim($imagePath, '/');
     $encoded = implode('/', array_map('rawurlencode', explode('/', $clean)));
 
@@ -696,7 +611,6 @@ function supabase_image_url(
         'width'   => $width,
         'quality' => $quality,
         'format'  => $format,
-        'resize'  => 'contain',
     ]);
 
     return SUPABASE_URL
@@ -706,6 +620,10 @@ function supabase_image_url(
         . '?' . $query;
 }
 
+// Extract the bucket-relative object path from a Supabase Storage public URL.
+// Strips the `{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/` prefix
+// and any trailing `?…` query string. Returns '' when the URL doesn't belong to
+// our configured bucket — caller should then treat the URL as opaque/legacy.
 function supabase_path_from_public_url(string $url): string
 {
     if ($url === '' || SUPABASE_URL === '' || SUPABASE_BUCKET === '') return '';
@@ -717,6 +635,10 @@ function supabase_path_from_public_url(string $url): string
     return rawurldecode($tail);
 }
 
+// Render an image entry into a final URL.
+// New shape: ['path' => 'bucket-relative path', 'version' => 'cache-buster', 'ordem' => N]
+//   → built via supabase_image_url() with the Image Transformation params.
+// Legacy shape: ['url' => 'full URL']  → returned as-is (LOCAL_DATA_MODE or foreign URLs).
 function product_image_render_url(
     array  $img,
     int    $width   = 400,
@@ -733,6 +655,23 @@ function product_image_render_url(
 }
 
 // ─── Helper: Bulk-fetch low-res image paths from ext_product_images ──────────
+// Direct PostgREST query against Supabase — one round-trip for the entire page.
+// Replaces the previous chain of:
+//   (a) Spark API HTTP calls (`repo_*`),
+//   (b) Supabase Storage object listings (`product_storage_*`),
+//   (c) on-disk PHP cache (`spark_img_v…`),
+// none of which scale beyond ~24 cards before saturating PHP-FPM workers.
+//
+// Equivalent SQL (PostgREST translates the params below into this query):
+//   SELECT product_code, file_path, position, updated_at, created_at
+//     FROM ext_product_images
+//    WHERE product_code IN (...)
+//      AND resolution_type = 'low'
+//      AND deleted_at IS NULL
+//    ORDER BY product_code, position;
+//
+// Service role bearer: the table has RLS that hides rows from anon callers;
+// the storefront is server-rendered so the key never leaves the PHP process.
 function db_products_images_low_bulk(array $productCodes): array
 {
     if (LOCAL_DATA_MODE || SUPABASE_URL === '') return [];
@@ -744,75 +683,36 @@ function db_products_images_low_bulk(array $productCodes): array
     $bearer = SUPABASE_SERVICE_KEY !== '' ? SUPABASE_SERVICE_KEY : SUPABASE_ANON_KEY;
     if ($bearer === '') return array_fill_keys($ids, []);
 
-    $out = array_fill_keys($ids, []);
-
-    $add_rows = function (array $rows) use (&$out) {
-        foreach ($rows as $row) {
-            if (!is_array($row)) continue;
-            $code = (string)($row['product_code'] ?? '');
-            if ($code === '' || !array_key_exists($code, $out)) continue;
-            $path = trim((string)($row['file_path'] ?? ''));
-            if ($path === '') continue;
-            $version = (string)($row['updated_at'] ?? ($row['created_at'] ?? ''));
-            $out[$code][] = [
-                'path'    => $path,
-                'version' => $version,
-                'ordem'   => intval($row['position'] ?? 0),
-            ];
-        }
-    };
-
-    $rows_strict = sb('ext_product_images', [
+    $rows = sb('ext_product_images', [
         'select'          => 'product_code,file_path,position,updated_at,created_at',
         'product_code'    => 'in.(' . implode(',', $ids) . ')',
         'resolution_type' => 'eq.low',
         'deleted_at'      => 'is.null',
         'order'           => 'product_code.asc,position.asc',
     ], 'GET', null, $bearer);
-    $add_rows((array)$rows_strict);
 
-    $missing = [];
-    foreach ($out as $k => $imgs) {
-        if (empty($imgs)) $missing[] = $k;
+    $out = array_fill_keys($ids, []);
+    foreach ((array)$rows as $row) {
+        if (!is_array($row)) continue;
+        $code = (string)($row['product_code'] ?? '');
+        if ($code === '' || !array_key_exists($code, $out)) continue;
+        $path = trim((string)($row['file_path'] ?? ''));
+        if ($path === '') continue;
+        // Defense in depth: the resolution_type filter should already exclude
+        // 'high' rows, but enforce the same word-boundary regex used by the
+        // render-time validator so a mis-labeled row can never leak through.
+        if (preg_match('/(^|[\/_.\-])high([\/_.\-]|$)/i', $path)) continue;
+        $version = (string)($row['updated_at'] ?? ($row['created_at'] ?? ''));
+        $out[$code][] = [
+            'path'    => $path,
+            'version' => $version,
+            'ordem'   => intval($row['position'] ?? 0),
+        ];
     }
-
-    if (!empty($missing)) {
-        $rows_relaxed = sb('ext_product_images', [
-            'select'       => 'product_code,file_path,position,updated_at,created_at',
-            'product_code' => 'in.(' . implode(',', $missing) . ')',
-            'order'        => 'product_code.asc,position.asc',
-        ], 'GET', null, $bearer);
-        $add_rows((array)$rows_relaxed);
-    }
-
-    $still_missing = [];
-    foreach ($out as $k => $imgs) {
-        if (empty($imgs)) $still_missing[] = $k;
-    }
-
-    if (!empty($still_missing)) {
-        $legacy_rows = sb('produto_imagem', [
-            'select' => 'codprod,url,ordem',
-            'codprod' => 'in.(' . implode(',', $still_missing) . ')',
-            'order' => 'codprod.asc,ordem.asc',
-        ], 'GET', null, $bearer);
-
-        foreach ((array)$legacy_rows as $row) {
-            if (!is_array($row)) continue;
-            $code = (string)intval($row['codprod'] ?? 0);
-            if ($code === '0' || !array_key_exists($code, $out)) continue;
-            $url = trim((string)($row['url'] ?? ''));
-            if ($url === '') continue;
-            $out[$code][] = [
-                'url'   => $url,
-                'ordem' => intval($row['ordem'] ?? 0),
-            ];
-        }
-    }
-
     return $out;
 }
 
+// Single-product convenience wrapper used by checkout endpoints.
 function product_images_low($codprod): array
 {
     $pid = (string)intval($codprod);
@@ -822,19 +722,19 @@ function product_images_low($codprod): array
 }
 
 // ─── Helper: Enrich products with price, stock, images (and optionally specs) ─
+//
+// $listing_mode = true  → skips the specs query (product grids never render them)
+//                         AND filters unavailable products BEFORE the image fetch,
+//                         so images are only fetched for products that will be shown.
+//                         Returns an already-filtered list; callers must NOT call
+//                         filter_available() again.
+// $listing_mode = false → full enrich including specs (used by product detail page).
 function enrich_products(array $products, bool $listing_mode = false): array
 {
     if (empty($products)) return [];
 
     $ids       = array_column($products, 'codprod');
     $in_clause = 'in.(' . implode(',', $ids) . ')';
-
-    // Dispara preço, estoque, imagens (e especs) TODAS em paralelo via sb_multi.
-    // Antes: preco/estoque rodavam paralelo, depois filtrava, depois imagens
-    // (3 round-trips sequenciais). Agora: 1 round-trip único. Aceitamos buscar
-    // imagens de produtos que serão filtrados depois — o ganho de latência
-    // compensa MUITO o tráfego extra de algumas linhas de metadata.
-    $bearer = (SUPABASE_SERVICE_KEY !== '') ? SUPABASE_SERVICE_KEY : SUPABASE_ANON_KEY;
 
     $batch_queries = [
         'preco'   => ['preco',   ['codprod' => $in_clause, 'select' => 'codprod,vlr_venda']],
@@ -843,99 +743,71 @@ function enrich_products(array $products, bool $listing_mode = false): array
     if (!$listing_mode) {
         $batch_queries['especs'] = ['especificacao', ['codprod' => $in_clause, 'select' => 'codprod,label,valor']];
     }
-    if (!LOCAL_DATA_MODE) {
-        $batch_queries['imgs_strict'] = ['ext_product_images', [
-            'select'          => 'product_code,file_path,position,updated_at,created_at',
-            'product_code'    => $in_clause,
-            'resolution_type' => 'eq.low',
-            'deleted_at'      => 'is.null',
-            'order'           => 'product_code.asc,position.asc',
-        ], 'GET', null, $bearer];
-    }
 
     $batch  = sb_multi($batch_queries);
-    $precos = $batch['preco']       ?? [];
-    $estoq  = $batch['estoque']     ?? [];
-    $especs = $batch['especs']      ?? [];
-    $imgs_s = $batch['imgs_strict'] ?? [];
+    $precos = $batch['preco']   ?? [];
+    $estoq  = $batch['estoque'] ?? [];
+    $especs = $batch['especs']  ?? [];
 
     $preco_map   = [];
-    foreach ($precos as $r) { $preco_map[$r['codprod']][] = $r; }
+    foreach ($precos as $r) {
+        $preco_map[$r['codprod']][]   = $r;
+    }
     $estoque_map = [];
-    foreach ($estoq  as $r) { $estoque_map[$r['codprod']][] = $r; }
+    foreach ($estoq  as $r) {
+        $estoque_map[$r['codprod']][] = $r;
+    }
     $spec_map    = [];
-    foreach ($especs as $r) { $spec_map[$r['codprod']][] = $r; }
-
-    // Monta imagens a partir do resultado strict
-    $imagem_map = [];
-    foreach ($ids as $id) { $imagem_map[(string)intval($id)] = []; }
-    foreach ((array)$imgs_s as $row) {
-        if (!is_array($row)) continue;
-        $code = (string)($row['product_code'] ?? '');
-        if ($code === '' || !array_key_exists($code, $imagem_map)) continue;
-        $path = trim((string)($row['file_path'] ?? ''));
-        if ($path === '') continue;
-        $imagem_map[$code][] = [
-            'path'    => $path,
-            'version' => (string)($row['updated_at'] ?? ($row['created_at'] ?? '')),
-            'ordem'   => intval($row['position'] ?? 0),
-        ];
+    foreach ($especs as $r) {
+        $spec_map[$r['codprod']][]    = $r;
     }
 
+    // Attach price, stock, and (in full mode) specs to every product.
+    // produto_imagem: in production we clear it here and fill from the bulk
+    // ext_product_images fetch below. In LOCAL_DATA_MODE the field is already
+    // attached by local_attach_produto_relations() from local-db.json, so
+    // leave it alone — the bulk fetch is skipped and there is nothing to
+    // replace it with.
     foreach ($products as &$prod) {
         $id = $prod['codprod'];
+        $prod['preco']          = $preco_map[$id]   ?? [];
+        $prod['estoque']        = $estoque_map[$id] ?? [];
+        $prod['especificacao']  = $listing_mode ? [] : ($spec_map[$id] ?? []);
+        if (!LOCAL_DATA_MODE) {
+            $prod['produto_imagem'] = [];
+        }
+    }
+    unset($prod);
+
+    // In listing mode, drop unavailable products NOW — before the expensive image
+    // fetch — so we never waste API calls or cache reads on products not shown.
+    if ($listing_mode) {
+        $products = filter_available($products);
+        if (empty($products)) return [];
+        $ids = array_column($products, 'codprod');
+    }
+
+    // Fetch images for the surviving product set: one PostgREST round-trip against
+    // ext_product_images, server-side filtered to resolution_type='low'.
+    $imagem_map = LOCAL_DATA_MODE ? [] : db_products_images_low_bulk($ids);
+
+    foreach ($products as &$prod) {
+        $id  = $prod['codprod'];
         $pid = (string)intval($id);
-        $prod['preco']         = $preco_map[$id]   ?? [];
-        $prod['estoque']       = $estoque_map[$id] ?? [];
-        $prod['especificacao'] = $listing_mode ? [] : ($spec_map[$id] ?? []);
+        // LOCAL_DATA_MODE keeps whatever shape local-db.json provides
+        // (legacy `{url, ordem}`); everything else uses the path-based shape
+        // built by db_products_images_low_bulk().
         $prod['produto_imagem'] = LOCAL_DATA_MODE
             ? ($prod['produto_imagem'] ?? [])
             : ($imagem_map[$pid] ?? []);
     }
     unset($prod);
 
-    if (!LOCAL_DATA_MODE) {
-        $missing = [];
-        foreach ($products as $p) {
-            $pid = (string)intval($p['codprod']);
-            if (empty($p['produto_imagem'])) $missing[] = $pid;
-        }
-        if (!empty($missing)) {
-            $fallback = db_products_images_low_bulk($missing);
-            foreach ($products as &$p) {
-                $pid = (string)intval($p['codprod']);
-                if (empty($p['produto_imagem']) && !empty($fallback[$pid])) {
-                    $p['produto_imagem'] = $fallback[$pid];
-                }
-            }
-            unset($p);
-        }
-    }
-
+    // Suppress products with no verified low-resolution imagery from grids and listings.
+    // Mirror prod_img()'s strict "low-only" gate so a product only survives if at
+    // least one image would actually render. Without this, products with neutral
+    // path naming (no _low_ token) leak into listings and display the fallback logo.
     if ($listing_mode) {
-        $products = filter_available($products);
-        if (empty($products)) return [];
-
-        // Fallback de imagens (relaxed + legacy) só para o que ficou sem imagem.
-        // Na prática quase nunca dispara, mas mantém paridade com o comportamento antigo.
-        if (!LOCAL_DATA_MODE) {
-            $missing = [];
-            foreach ($products as $p) {
-                $pid = (string)intval($p['codprod']);
-                if (empty($p['produto_imagem'])) $missing[] = $pid;
-            }
-            if (!empty($missing)) {
-                $fallback = db_products_images_low_bulk($missing);
-                foreach ($products as &$p) {
-                    $pid = (string)intval($p['codprod']);
-                    if (empty($p['produto_imagem']) && !empty($fallback[$pid])) {
-                        $p['produto_imagem'] = $fallback[$pid];
-                    }
-                }
-                unset($p);
-            }
-        }
-
         $products = array_values(array_filter(
             $products,
             fn($p) => LOCAL_DATA_MODE || prod_img($p['produto_imagem'] ?? []) !== '/assets/images/produtos/logo.png'
@@ -949,11 +821,6 @@ function enrich_products(array $products, bool $listing_mode = false): array
 function filter_available(array $products): array
 {
     return array_values(array_filter($products, function ($p) {
-        // [ALTERAÇÃO AQUI]: Se for o modo local, perdoamos sempre a falta de preço ou stock.
-        if (LOCAL_DATA_MODE) {
-            return true; 
-        }
-        
         $price = $p['preco'][0]['vlr_venda']           ?? 0;
         $stock = $p['estoque'][0]['estoque_disponivel'] ?? 0;
         return $price > 0 && $stock > 0;
@@ -968,25 +835,12 @@ if (!defined('PROD_FETCH_BATCH')) define('PROD_FETCH_BATCH', 72);
 function fetch_products($extra_params = [], $limit = 20)
 {
     $params = array_merge([
-        'select' => 'codprod,descrprod,comnome,desccurta,codgrupoprod,peso,altura,largura,comprimento',
+        'select' => 'codprod,descrprod,comnome,desccurta,codgrupoprod',
         'limit'  => $limit,
     ], $extra_params);
-    require_once __DIR__ . '/cache.php';
-    $ck = '';
-    if (!LOCAL_DATA_MODE) {
-        $ck = 'fetch_prods_' . md5(json_encode([$params], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
-        $hit = cache_get($ck, 60);
-        if (is_array($hit)) return $hit;
-    }
-
     $products = sb('produto', $params);
     if (empty($products)) return [];
-    $enriched = enrich_products($products, true);
-
-    if (!LOCAL_DATA_MODE && $ck !== '') {
-        cache_set($ck, $enriched, 60);
-    }
-    return $enriched;
+    return enrich_products($products, true); // listing_mode: no specs, filter before images
 }
 
 // ─── Helper: Fetch all categories organized ──────────────────────────────────
@@ -996,13 +850,15 @@ function fetch_categories(bool $include_hidden = true)
     $cache_key = $include_hidden ? 'all' : 'visible';
     if (isset($mem[$cache_key])) return $mem[$cache_key];
 
-    require_once __DIR__ . '/cache.php';
-    $ck = 'fetch_cats_' . $cache_key;
+    // File cache: 5-minute TTL (avoids re-fetching on every page request)
     if (!LOCAL_DATA_MODE) {
-        $hit = cache_get($ck, 300);
-        if (is_array($hit) && !empty($hit)) {
-            $mem[$cache_key] = $hit;
-            return $hit;
+        $cache_file = sys_get_temp_dir() . '/spark_cats_' . $cache_key . '.json';
+        if (file_exists($cache_file) && (time() - filemtime($cache_file)) < 300) {
+            $cached = json_decode(file_get_contents($cache_file), true);
+            if (is_array($cached) && !empty($cached)) {
+                $mem[$cache_key] = $cached;
+                return $cached;
+            }
         }
     }
 
@@ -1028,8 +884,8 @@ function fetch_categories(bool $include_hidden = true)
         }
     }
 
-    if (!LOCAL_DATA_MODE) {
-        cache_set($ck, $level1, 300);
+    if (!LOCAL_DATA_MODE && isset($cache_file)) {
+        @file_put_contents($cache_file, json_encode($level1));
     }
 
     $mem[$cache_key] = $level1;
